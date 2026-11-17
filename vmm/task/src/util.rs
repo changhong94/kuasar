@@ -154,11 +154,51 @@ where
     Ok(Vec::new())
 }
 
+#[derive(Default, Debug, serde::Serialize)]
+pub struct ProcessTiming {
+    pub pid: u32,
+    pub subscribe_us: u128,
+    pub spawn_us: u128,
+    pub first_stdout_us: u128,
+    pub stdout_eof_us: u128,
+    pub exit_us: u128,
+    pub total_us: u128,
+}
+
 pub async fn spawn_and_wait(
-    mut cmd: std::process::Command,
+    cmd: std::process::Command,
     stdin: &[u8],
 ) -> Result<(String, String, i32)> {
+    spawn_and_wait_profile(cmd, stdin, None).await
+}
+
+#[derive(Debug)]
+pub enum ProcessEvent {
+    Start(u32),
+    Stdout(Vec<u8>),
+    Stderr(Vec<u8>),
+}
+
+pub async fn spawn_and_wait_profile(
+    cmd: std::process::Command,
+    stdin: &[u8],
+    timing: Option<&mut ProcessTiming>,
+) -> Result<(String, String, i32)> {
+    spawn_and_wait_stream(cmd, stdin, timing, None).await
+}
+
+pub async fn spawn_and_wait_stream(
+    mut cmd: std::process::Command,
+    stdin: &[u8],
+    mut timing: Option<&mut ProcessTiming>,
+    events: Option<&tokio::sync::mpsc::Sender<ProcessEvent>>,
+) -> Result<(String, String, i32)> {
+    let started = std::time::Instant::now();
     let mut monitor = PidMonitorGuard::subscribe().await?;
+    if let Some(t) = timing.as_deref_mut() {
+        t.subscribe_us = started.elapsed().as_micros();
+    }
+    let spawn_started = std::time::Instant::now();
     let child = match cmd.spawn() {
         Ok(child) => child,
         Err(e) => {
@@ -170,8 +210,17 @@ pub async fn spawn_and_wait(
         }
     };
 
+    if let Some(t) = timing.as_deref_mut() {
+        t.spawn_us = spawn_started.elapsed().as_micros();
+    }
     let pid = child.id();
+    if let Some(t) = timing.as_deref_mut() {
+        t.pid = pid;
+    }
     let mut child = Some(child);
+    if let Some(events) = events {
+        let _ = events.send(ProcessEvent::Start(pid)).await;
+    }
 
     let mut process_exited = false;
 
@@ -228,11 +277,64 @@ pub async fn spawn_and_wait(
         #[cfg(test)]
         spawn_test_reaper(&mut child, pid);
 
-        let (stdout_bytes, stderr_bytes, exit_code) = tokio::join!(
-            read_std_bytes(stdout_stream),
-            read_std_bytes(stderr_stream),
-            monitor.wait(pid as i32)
-        );
+        let profile = timing.is_some() || events.is_some();
+        let stdout = async {
+            if !profile {
+                return (read_std_bytes(stdout_stream).await, 0, 0);
+            }
+            let mut out = Vec::new();
+            let mut first = 0;
+            if let Some(mut stream) = stdout_stream {
+                let mut buf = [0u8; 4096];
+                loop {
+                    let n = match stream.read(&mut buf).await {
+                        Ok(n) => n,
+                        Err(e) => return (Err(e), first, started.elapsed().as_micros()),
+                    };
+                    if n == 0 {
+                        break;
+                    }
+                    if first == 0 {
+                        first = started.elapsed().as_micros();
+                    }
+                    if let Some(events) = events {
+                        // A disconnected receiver does not orphan the process:
+                        // continue draining and reaping, without retaining output.
+                        let _ = events.send(ProcessEvent::Stdout(buf[..n].to_vec())).await;
+                    } else {
+                        out.extend_from_slice(&buf[..n]);
+                    }
+                }
+            }
+            (Ok(out), first, started.elapsed().as_micros())
+        };
+        let exit = async {
+            let code = monitor.wait(pid as i32).await;
+            (code, started.elapsed().as_micros())
+        };
+        let stderr = async {
+            if let Some(events) = events {
+                if let Some(mut stream) = stderr_stream {
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        let n = stream.read(&mut buf).await?;
+                        if n == 0 { break; }
+                        let _ = events.send(ProcessEvent::Stderr(buf[..n].to_vec())).await;
+                    }
+                }
+                Ok(Vec::new())
+            } else {
+                read_std_bytes(stderr_stream).await
+            }
+        };
+        let ((stdout_bytes, first, eof), stderr_bytes, (exit_code, exit_time)) =
+            tokio::join!(stdout, stderr, exit);
+        if let Some(t) = timing.as_deref_mut() {
+            t.first_stdout_us = first;
+            t.stdout_eof_us = eof;
+            t.exit_us = exit_time;
+            t.total_us = started.elapsed().as_micros();
+        }
 
         process_exited = true;
 
@@ -358,5 +460,49 @@ mod tests {
             assert_eq!(read_back.stdin, "stdin", "case: {}", case.name);
             assert_eq!(io_path.exists(), !case.should_remove, "case: {}", case.name);
         }
+    }
+}
+
+#[cfg(test)]
+mod streaming_tests {
+    use super::*;
+    use std::process::{Command, Stdio};
+    #[tokio::test]
+    async fn streaming_stdout_precedes_exit_and_retains_stderr_status() {
+        let directory = temp_dir::TempDir::new().unwrap();
+        let release = directory.path().join("release");
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", "printf READY; n=0; while [ ! -f \"$1\" ] && [ $n -lt 200 ]; do sleep .01; n=$((n+1)); done; printf error >&2; exit 7", "test"])
+            .arg(&release).stdout(Stdio::piped()).stderr(Stdio::piped());
+        let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+        let running = tokio::spawn(async move {
+            spawn_and_wait_stream(cmd, &[], None, Some(&tx)).await.unwrap()
+        });
+        assert!(matches!(rx.recv().await.unwrap(), ProcessEvent::Start(_)));
+        match tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv()).await.unwrap().unwrap() {
+            ProcessEvent::Stdout(data) => assert_eq!(data, b"READY"),
+            other => panic!("unexpected event: {other:?}"),
+        }
+        assert!(!running.is_finished());
+        std::fs::write(&release, b"ok").unwrap();
+        let mut errors = Vec::new();
+        while let Some(event) = rx.recv().await {
+            if let ProcessEvent::Stderr(data) = event { errors.extend(data); }
+        }
+        let (out, err, code) = running.await.unwrap();
+        assert!(out.is_empty() && err.is_empty());
+        assert_eq!(errors, b"error");
+        assert_eq!(code, 7);
+    }
+    #[tokio::test]
+    async fn streaming_disconnected_receiver_still_drains_and_reaps() {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", "head -c 1048576 /dev/zero; printf err >&2; exit 3"])
+            .stdout(Stdio::piped()).stderr(Stdio::piped());
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        drop(rx);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(3),
+            spawn_and_wait_stream(cmd, &[], None, Some(&tx))).await.unwrap().unwrap();
+        assert_eq!(result, (String::new(), String::new(), 3));
     }
 }

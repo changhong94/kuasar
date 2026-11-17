@@ -99,3 +99,46 @@ impl TrafficFilterSetRequest {
         self
     }
 }
+
+/// Equivalent to `tc filter del dev TAP ingress pref 1`, including kernel ACK.
+/// Leave the mirroring filters at other priorities and the qdisc intact.
+pub(crate) async fn delete_fork_drop_filter(mut handle: Handle, index: u32) -> Result<(), Error> {
+    let mut message = TcMessage::default();
+    message.header.index = index as i32;
+    message.header.parent = 0xfffffff2u32.into(); // TC_H_MIN_INGRESS
+    message.header.info = 1 << 16; // priority 1, wildcard protocol
+    let mut req = NetlinkMessage::from(RouteNetlinkMessage::DelTrafficFilter(message));
+    req.header.flags = NLM_F_REQUEST | NLM_F_ACK;
+    let mut response = handle.request(req)?;
+    while let Some(message) = response.next().await { try_nl!(message); }
+    Ok(())
+}
+
+#[cfg(test)]
+mod fork_filter_tests {
+    use super::*;
+    use futures_util::TryStreamExt;
+    #[tokio::test]
+    #[ignore = "requires root in a fresh private network namespace"]
+    async fn delete_only_fork_priority() {
+        assert_ne!(std::fs::read_link("/proc/self/ns/net").unwrap(),
+                   std::fs::read_link("/proc/1/ns/net").unwrap());
+        for args in [vec!["ip","link","add","forkdiag0","type","dummy"],
+                     vec!["tc","qdisc","add","dev","forkdiag0","ingress"],
+                     vec!["tc","filter","add","dev","forkdiag0","ingress","pref","1","matchall","action","drop"],
+                     vec!["tc","filter","add","dev","forkdiag0","ingress","pref","2","matchall","action","drop"]] {
+            assert!(std::process::Command::new(args[0]).args(&args[1..]).status().unwrap().success());
+        }
+        let (connection,handle,_) = rtnetlink::new_connection().unwrap();
+        tokio::spawn(connection);
+        let link = handle.link().get().match_name("forkdiag0".into()).execute()
+            .try_next().await.unwrap().unwrap();
+        delete_fork_drop_filter(handle.clone(),link.header.index).await.unwrap();
+        let out=std::process::Command::new("tc").args(["-j","filter","show","dev","forkdiag0","ingress"]).output().unwrap();
+        assert!(out.status.success());
+        let filters:serde_json::Value=serde_json::from_slice(&out.stdout).unwrap();
+        assert!(!filters.as_array().unwrap().is_empty());
+        assert!(filters.as_array().unwrap().iter().all(|f| f["pref"] == 2));
+        assert!(delete_fork_drop_filter(handle,link.header.index).await.is_err());
+    }
+}

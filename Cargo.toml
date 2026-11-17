@@ -23,4 +23,23 @@ codegen-units = 1
 strip = "debuginfo"
 
 [patch.crates-io]
-ttrpc = { git = "https://github.com/kuasar-io/ttrpc-rust.git", branch = "v0.7.1-kuasar" }
+ttrpc = { path = "../ttrpc-rust" }
+
+# Same-host fork research: fix cgroup-v1 OOM eventfd ownership in the guest
+# agent's shim dependency. Keep related crates on the same local source.
+[patch."https://github.com/kuasar-io/rust-extensions.git"]
+containerd-shim = { path = "../rust-extensions/crates/shim" }
+containerd-shim-protos = { path = "../rust-extensions/crates/shim-protos" }
+containerd-sandbox = { path = "../rust-extensions/crates/sandbox" }
+runc = { path = "../rust-extensions/crates/runc" }
+
+[patch."https://github.com/kuasar-io/ttrpc-rust.git"]
+ttrpc = { path = "../ttrpc-rust" }
+
+# The agent and VMM controller serve latency-sensitive restore/RPC paths.
+# Keep the compact dependency profile, but optimize these paths for execution.
+[profile.release.package.vmm-task]
+opt-level = 3
+
+[profile.release.package.vmm-sandboxer]
+opt-level = 3

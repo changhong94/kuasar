@@ -171,7 +171,7 @@ impl ContainerFactory<KuasarContainer> for KuasarFactory {
             verify_orphan_alive(id, adoption.orphan_pid, &orphan_container_id)?;
             let mut init = InitProcess::new(
                 id,
-                Stdio::default(),
+                Stdio::new("", "", "", false),
                 KuasarInitLifecycle::new_adopted(
                     runc.clone(),
                     opts.clone(),
@@ -371,11 +371,15 @@ impl ProcessFactory<ExecProcess> for KuasarExecFactory {
     #[instrument(skip_all)]
     async fn create(&self, req: &ExecProcessRequest) -> Result<ExecProcess> {
         let p = get_spec_from_request(req)?;
-        let stdio = match read_io(&self.bundle, req.id(), Some(req.exec_id())).await {
-            // terminal is still determined from request
-            Ok(io) => Stdio::new(&io.stdin, &io.stdout, &io.stderr, req.terminal()),
-            Err(_) => Stdio::new(req.stdin(), req.stdout(), req.stderr(), req.terminal()),
-        };
+        let stdio =
+            if vmm_common::self_describing_stream_io(&[req.stdin(), req.stdout(), req.stderr()]) {
+                Stdio::new(req.stdin(), req.stdout(), req.stderr(), req.terminal())
+            } else {
+                match read_io(&self.bundle, req.id(), Some(req.exec_id())).await {
+                    Ok(io) => Stdio::new(&io.stdin, &io.stdout, &io.stderr, req.terminal()),
+                    Err(_) => Stdio::new(req.stdin(), req.stdout(), req.stderr(), req.terminal()),
+                }
+            };
         let stdio = convert_stdio(&stdio).await?;
         Ok(ExecProcess {
             state: Status::CREATED,
@@ -544,13 +548,57 @@ impl KuasarInitLifecycle {
     }
 }
 
+// runc writes its PID handoff with O_SYNC. The container bundle can be a
+// writable block device; PID handoffs belong to /run, just like runc state.
+// Keep a private directory alive until Start completes, and remove it on every
+// exit path. No descriptor or PID file survives into the next VM fork.
+struct ExecPidFile(std::path::PathBuf);
+
+impl ExecPidFile {
+    fn new_in(root: &Path) -> std::io::Result<Self> {
+        use std::{
+            os::unix::fs::DirBuilderExt,
+            sync::atomic::{AtomicU64, Ordering},
+        };
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        loop {
+            let path = root.join(format!(
+                "kuasar-exec-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            match std::fs::DirBuilder::new().mode(0o700).create(&path) {
+                Ok(()) => return Ok(Self(path)),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    fn path(&self) -> std::path::PathBuf {
+        self.0.join("pid")
+    }
+}
+
+impl Drop for ExecPidFile {
+    fn drop(&mut self) {
+        if let Err(e) = std::fs::remove_dir_all(&self.0) {
+            log::warn!("failed to remove exec PID handoff {:?}: {}", self.0, e);
+        }
+    }
+}
+
 #[async_trait]
 impl ProcessLifecycle<ExecProcess> for KuasarExecLifecycle {
     #[instrument(skip_all)]
     async fn start(&self, p: &mut ExecProcess) -> containerd_shim::Result<()> {
+        let timing = std::time::Instant::now();
         rescan_pci_bus().await?;
+        let scan_ms = timing.elapsed().as_secs_f64() * 1000.0;
         let bundle = self.bundle.to_string();
-        let pid_path = Path::new(&bundle).join(format!("{}.pid", &p.id));
+        let pid_file = ExecPidFile::new_in(Path::new("/run"))
+            .map_err(other_error!(e, "failed to create exec PID handoff"))?;
+        let pid_path = pid_file.path();
         let mut exec_opts = runc::options::ExecOpts {
             io: None,
             pid_file: Some(pid_path.to_owned()),
@@ -566,6 +614,7 @@ impl ProcessLifecycle<ExecProcess> for KuasarExecLifecycle {
             exec_opts.io = pio.io.as_ref().cloned();
             (None, Some(pio))
         };
+        let io_ms = timing.elapsed().as_secs_f64() * 1000.0;
         //TODO  checkpoint support
         let exec_result = self
             .runtime
@@ -577,10 +626,29 @@ impl ProcessLifecycle<ExecProcess> for KuasarExecLifecycle {
             }
             return Err(runtime_error(&bundle, e, "OCI runtime exec failed").await);
         }
+        let runc_ms = timing.elapsed().as_secs_f64() * 1000.0;
         copy_io_or_console(p, socket, pio, p.lifecycle.exit_signal.clone()).await?;
+        let copy_ms = timing.elapsed().as_secs_f64() * 1000.0;
         let pid = read_file_to_str(pid_path).await?.parse::<i32>()?;
         p.pid = pid;
         p.state = Status::RUNNING;
+        if std::env::var_os("KUASAR_EXEC_TIMING").is_some() {
+            use std::io::Write;
+            if let Ok(mut file) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/run/kuasar-exec-timing.jsonl")
+            {
+                let _ = writeln!(
+                    file,
+                    "{}",
+                    serde_json::json!({"id": p.id,
+                    "scan_ms": scan_ms, "io_ms": io_ms-scan_ms,
+                    "runc_ms": runc_ms-io_ms, "copy_ms": copy_ms-runc_ms,
+                    "pid_ms": timing.elapsed().as_secs_f64()*1000.0-copy_ms})
+                );
+            }
+        }
         Ok(())
     }
 
@@ -610,6 +678,7 @@ impl ProcessLifecycle<ExecProcess> for KuasarExecLifecycle {
     #[instrument(skip_all)]
     async fn delete(&self, p: &mut ExecProcess) -> Result<()> {
         self.exit_signal.signal();
+        // Compatibility cleanup for processes inherited from an older agent.
         let exec_pid_path = Path::new(self.bundle.as_str()).join(format!("{}.pid", p.id));
         remove_file(exec_pid_path).await.unwrap_or_default();
         Ok(())
@@ -853,5 +922,38 @@ mod tests {
             actual_err.to_string(),
             expected_msg
         );
+    }
+}
+
+#[cfg(test)]
+mod exec_pid_tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::ExecPidFile;
+
+    #[test]
+    fn handoffs_are_private_distinct_and_cleaned_on_error() {
+        let root = temp_dir::TempDir::new().unwrap();
+        let first = ExecPidFile::new_in(root.path()).unwrap();
+        let second = ExecPidFile::new_in(root.path()).unwrap();
+        assert_ne!(first.path(), second.path());
+        assert_eq!(
+            std::fs::metadata(&first.0).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        let failed = (|| -> std::io::Result<()> {
+            let third = ExecPidFile::new_in(root.path())?;
+            std::fs::write(third.path(), b"123")?;
+            // Include runc's temporary rename source in failure cleanup.
+            std::fs::write(third.0.join(".pid"), b"123")?;
+            Err(std::io::Error::other("runc failed"))
+        })();
+        assert!(failed.is_err());
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 2);
+        std::fs::write(first.path(), b"456").unwrap();
+        assert_eq!(std::fs::read_to_string(first.path()).unwrap(), "456");
+        drop(first);
+        drop(second);
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
     }
 }

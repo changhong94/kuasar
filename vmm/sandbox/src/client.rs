@@ -65,6 +65,73 @@ pub(crate) async fn new_sandbox_client(address: &str) -> Result<SandboxServiceCl
     Ok(SandboxServiceClient::new(client))
 }
 
+// Snapshot guests may still be resuming when CONNECT reaches the VMM. Keep
+// an accepted handshake alive instead of discarding its pending response after
+// 10ms. The outer connection deadline and retry backoff remain unchanged.
+pub(crate) async fn new_snapshot_sandbox_client(address: &str) -> Result<SandboxServiceClient> {
+    let handshake_ms = std::env::var("KUASAR_SNAPSHOT_HANDSHAKE_MS")
+        .ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(100).clamp(10, 100);
+    let attempt = async {
+        loop {
+            let started = std::time::Instant::now();
+            let result = if let Some(addr) = address.strip_prefix("hvsock://") {
+                connect_to_hvsocket_with_timeout(addr, handshake_ms).await
+            } else {
+                connect_to_socket(address).await
+            };
+            match result {
+                Ok(fd) => return SandboxServiceClient::new(Client::new(fd)),
+                Err(error) => tracing::info!(%error, elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+                    "snapshot agent connect retry"),
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    };
+    timeout(Duration::from_secs(NEW_TTRPC_CLIENT_TIMEOUT), attempt).await
+        .map_err(|_| anyhow!("snapshot agent connection deadline exceeded: {}", address).into())
+}
+
+/// A connection accepted during a vsock reset can immediately become unusable.
+/// Retry the complete connect/check operation, never keep probing a dead client.
+/// The overall deadline remains the existing agent check deadline.
+pub(crate) async fn reconnect_checked_sandbox_client(
+    address: &str,
+) -> Result<SandboxServiceClient> {
+    let mut last_error = String::new();
+    let attempt = async {
+        loop {
+            let result = async {
+                let client = new_sandbox_client(address).await?;
+                client
+                    .check(with_timeout(1_000_000_000), &CheckRequest::new())
+                    .await
+                    .map_err(|e| anyhow!("agent check: {}", e))?;
+                Ok::<_, Error>(client)
+            }
+            .await;
+            match result {
+                Ok(client) => return client,
+                Err(error) => {
+                    tracing::warn!(%address, %error, "reconnecting failed fork agent transport");
+                    last_error = error.to_string();
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    };
+    timeout(Duration::from_secs(DEFAULT_CLIENT_CHECK_TIMEOUT), attempt)
+        .await
+        .map_err(|_| {
+            anyhow!(
+                "{}s timeout reconnecting agent {}: {}",
+                DEFAULT_CLIENT_CHECK_TIMEOUT,
+                address,
+                last_error
+            )
+            .into()
+        })
+}
+
 pub(crate) async fn new_sandbox_client_fail_fast(address: &str) -> Result<SandboxServiceClient> {
     let client =
         new_ttrpc_client_with_fast_fail(address, FAST_FAIL_CONNECT_TIMEOUT_IN_SECS).await?;
@@ -226,6 +293,10 @@ async fn connect_to_vsocket(address: &str) -> Result<RawFd> {
 }
 
 async fn connect_to_hvsocket(address: &str) -> Result<RawFd> {
+    connect_to_hvsocket_with_timeout(address, HVSOCK_RETRY_TIMEOUT_IN_MS).await
+}
+
+async fn connect_to_hvsocket_with_timeout(address: &str, handshake_ms: u64) -> Result<RawFd> {
     let (addr, port) = {
         let v: Vec<&str> = address.split(':').collect();
         if v.len() < 2 {
@@ -253,9 +324,9 @@ async fn connect_to_hvsocket(address: &str) -> Result<RawFd> {
         }
     };
 
-    timeout(Duration::from_millis(HVSOCK_RETRY_TIMEOUT_IN_MS), fut)
+    timeout(Duration::from_millis(handshake_ms), fut)
         .await
-        .map_err(|_| anyhow!("hvsock retry {}ms timeout", HVSOCK_RETRY_TIMEOUT_IN_MS))?
+        .map_err(|_| anyhow!("hvsock retry {}ms timeout", handshake_ms))?
 }
 
 pub fn unix_sock(r#abstract: bool, socket_path: &str) -> Result<UnixAddr> {
@@ -400,7 +471,9 @@ fn checked_compute_delta(c_send: i64, c_arrive: i64, s_send: i64, s_arrive: i64)
 }
 
 pub(crate) async fn publish_event(envelope: Envelope) -> Result<()> {
-    let publisher = RemotePublisher::new("/run/containerd/containerd.sock.ttrpc")
+    let address = std::env::var("KUASAR_CONTAINERD_TTRPC_ADDRESS")
+        .unwrap_or_else(|_| "/run/containerd/containerd.sock.ttrpc".into());
+    let publisher = RemotePublisher::new(&address)
         .await
         .map_err(|e| anyhow!("publisher connects to containerd: {}", e))?;
 
@@ -422,15 +495,73 @@ pub(crate) async fn publish_event(envelope: Envelope) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::io::ErrorKind;
+    use std::{io::ErrorKind, time::Duration};
+    use nix::unistd::close;
+    use tokio::{io::{AsyncBufReadExt, AsyncWriteExt, BufReader}, time::timeout};
 
     use anyhow::anyhow;
     use containerd_sandbox::error::Error;
 
     use crate::client::{
-        checked_compute_delta, is_fatal_error, new_ttrpc_client_with_fast_fail,
+        checked_compute_delta, connect_to_hvsocket_with_timeout, is_fatal_error, new_ttrpc_client_with_fast_fail,
         new_ttrpc_client_with_timeout,
     };
+
+    #[tokio::test]
+    async fn fork_reconnect_replaces_a_reset_connection() {
+        use std::{sync::Arc, time::Duration};
+
+        use vmm_common::api::{
+            empty::Empty,
+            sandbox::CheckRequest,
+            sandbox_ttrpc::{create_sandbox_service, SandboxService},
+        };
+        struct Healthy;
+        #[async_trait::async_trait]
+        impl SandboxService for Healthy {
+            async fn check(
+                &self,
+                _: &ttrpc::r#async::TtrpcContext,
+                _: CheckRequest,
+            ) -> ttrpc::Result<Empty> {
+                Ok(Empty::new())
+            }
+        }
+        let path = format!("/tmp/kuasar-reconnect-{}.sock", uuid::Uuid::new_v4());
+        let address = format!("unix://{}", path);
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let serve_address = address.clone();
+        let reset = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            drop(stream);
+            drop(listener);
+            std::fs::remove_file(path).unwrap();
+            let mut server = ttrpc::r#async::Server::new()
+                .bind(&serve_address)
+                .unwrap()
+                .register_service(create_sandbox_service(Arc::new(Box::new(Healthy))));
+            server.start().await.unwrap();
+            server
+        });
+        let client = tokio::time::timeout(
+            Duration::from_secs(3),
+            super::reconnect_checked_sandbox_client(&address),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        client
+            .check(
+                ttrpc::context::with_timeout(1_000_000_000),
+                &CheckRequest::new(),
+            )
+            .await
+            .unwrap();
+        drop(client);
+        let mut server = reset.await.unwrap();
+        server.shutdown().await.unwrap();
+        let _ = std::fs::remove_file(address.strip_prefix("unix://").unwrap());
+    }
 
     #[tokio::test]
     async fn test_new_ttrpc_client_timeout() {
@@ -486,4 +617,40 @@ mod tests {
         let actual_delta = checked_compute_delta(c_send, c_arrive, s_send, s_arrive).unwrap();
         assert_eq!(expect_delta, actual_delta);
     }
+    #[tokio::test]
+    async fn snapshot_handshake_keeps_delayed_response() {
+        let path = std::env::temp_dir().join(format!("kuasar-hvsock-{}-{}", std::process::id(), uuid::Uuid::new_v4()));
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = String::new();
+            BufReader::new(&mut stream).read_line(&mut request).await.unwrap();
+            assert_eq!(request, "CONNECT 1024\n");
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            stream.write_all(b"OK 1024\n").await.unwrap();
+        });
+        let fd = connect_to_hvsocket_with_timeout(&format!("{}:1024", path.display()), 100)
+            .await.unwrap();
+        close(fd).unwrap();
+        server.await.unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn snapshot_handshake_timeout_closes_pending_socket() {
+        let path = std::env::temp_dir().join(format!("kuasar-hvsock-{}-{}", std::process::id(), uuid::Uuid::new_v4()));
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let server = tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = String::new();
+            BufReader::new(&mut stream).read_line(&mut request).await.unwrap();
+            let mut byte = [0];
+            assert_eq!(timeout(Duration::from_secs(1), stream.read(&mut byte)).await.unwrap().unwrap(), 0);
+        });
+        assert!(connect_to_hvsocket_with_timeout(&format!("{}:1024", path.display()), 10).await.is_err());
+        server.await.unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
 }

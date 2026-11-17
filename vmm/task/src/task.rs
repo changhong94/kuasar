@@ -24,8 +24,10 @@ use containerd_shim::{
         task::TaskService,
         util::read_spec,
     },
+    event::Event,
     monitor::{Subject, Topic},
-    protos::protobuf::MessageDyn,
+    protos::{events::task::TaskExit, protobuf::MessageDyn},
+    util::convert_to_timestamp,
 };
 use log::{debug, error};
 use oci_spec::runtime::{LinuxNamespaceType, Spec};
@@ -71,6 +73,7 @@ pub(crate) async fn create_task_service(
 
 async fn process_exits(s: Subscription, task: &TaskService<Factory, RealContainer>) {
     let containers = task.containers.clone();
+    let tx = task.tx.clone();
     let mut s = s;
     tokio::spawn(async move {
         while let Some(e) = s.rx.recv().await {
@@ -89,14 +92,37 @@ async fn process_exits(s: Subscription, task: &TaskService<Factory, RealContaine
                         }
                         // set exit for init process
                         cont.init.set_exited(exit_code).await;
+                        let event = TaskExit {
+                            container_id: cont.id.clone(),
+                            id: cont.id.clone(),
+                            pid: pid as u32,
+                            exit_status: exit_code as u32,
+                            exited_at: Some(convert_to_timestamp(cont.init.exited_at().await))
+                                .into(),
+                            ..Default::default()
+                        };
+                        if let Err(e) = tx.send((event.topic().into(), Box::new(event))).await {
+                            error!("publish init exit: {}", e);
+                        }
                         break;
                     }
 
                     // pid belongs to container common process
-                    for (_exec_id, p) in cont.processes.iter_mut() {
+                    for (exec_id, p) in cont.processes.iter_mut() {
                         // set exit for exec process
                         if p.pid == pid {
                             p.set_exited(exit_code).await;
+                            let event = TaskExit {
+                                container_id: cont.id.clone(),
+                                id: exec_id.clone(),
+                                pid: pid as u32,
+                                exit_status: exit_code as u32,
+                                exited_at: Some(convert_to_timestamp(p.exited_at().await)).into(),
+                                ..Default::default()
+                            };
+                            if let Err(e) = tx.send((event.topic().into(), Box::new(event))).await {
+                                error!("publish exec exit: {}", e);
+                            }
                             break;
                         }
                     }

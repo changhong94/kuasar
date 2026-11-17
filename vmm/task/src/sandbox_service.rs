@@ -25,10 +25,8 @@ use std::{
 use async_trait::async_trait;
 use containerd_sandbox::PodSandboxConfig;
 use containerd_shim::{
-    error::Result,
-    protos::{protobuf::MessageDyn, topics::TASK_OOM_EVENT_TOPIC},
-    util::convert_to_any,
-    Error, TtrpcContext, TtrpcResult,
+    error::Result, protos::protobuf::MessageDyn, util::convert_to_any, Error, TtrpcContext,
+    TtrpcResult,
 };
 use log::debug;
 use nix::{
@@ -63,11 +61,14 @@ use crate::youki::YoukiContainer as KuasarContainer;
 use crate::{
     netlink::Handle,
     sandbox::{setup_sandbox, SandboxResources},
-    util::spawn_and_wait,
     NAMESPACE,
 };
 
 pub struct SandboxService {
+    pub connections: ttrpc::asynchronous::ConnectionTracker,
+    pub fork_gate: Arc<crate::fork::ForkGate>,
+    tcp_template: Arc<crate::tcp_template::TemplateTcp>,
+    fork_control_lock: Mutex<()>,
     pub namespace: String,
     pub handle: Arc<Mutex<Handle>>,
     #[allow(clippy::type_complexity)]
@@ -86,6 +87,10 @@ impl SandboxService {
     ) -> Result<Self> {
         let handle = Handle::new()?;
         Ok(Self {
+            fork_gate: Arc::default(),
+            tcp_template: Arc::default(),
+            fork_control_lock: Mutex::new(()),
+            connections: Default::default(),
             namespace: NAMESPACE.to_string(),
             handle: Arc::new(Mutex::new(handle)),
             rx: Arc::new(Mutex::new(rx)),
@@ -101,6 +106,120 @@ impl SandboxService {
 
 #[async_trait]
 impl api::sandbox_ttrpc::SandboxService for SandboxService {
+    async fn fork_control(
+        &self,
+        _ctx: &TtrpcContext,
+        req: api::sandbox::ForkControlRequest,
+    ) -> TtrpcResult<api::sandbox::ForkControlResponse> {
+        let _control = self.fork_control_lock.lock().await;
+        let started = std::time::Instant::now();
+        let mut previous = started;
+        let mut timing = Vec::new();
+        let mut identity_work = None;
+        let mut mark = |phase: &str| {
+            let now = std::time::Instant::now();
+            timing.push((phase.to_owned(), (now-previous).as_micros() as u64));
+            previous = now;
+        };
+        if !req.entropy.is_empty() && (!req.release || req.entropy.len() != 32) {
+            return Err(ttrpc::Error::Others("Fork entropy requires release and 32 bytes".into()));
+        }
+        if req.prepare_tcp_empty && req.release {
+            return Err(ttrpc::Error::Others("TCP preparation requires a closed barrier".into()));
+        }
+        let certificate = if req.skip_tcp_if_certified {
+            self.tcp_template.certificate(&req.token).await
+        } else { None };
+        let skip_tcp = certificate.is_some();
+        let reset_network = req.release && !req.old_mac.is_empty();
+        if !req.entropy.is_empty() || reset_network {
+            // Validate ownership once, and keep both gates closed on any error.
+            self.fork_gate.control(&req.token, false).await?;
+        }
+        if reset_network {
+            let seed = req.entropy.clone();
+            let queued = std::time::Instant::now();
+            let cleanup = tokio::task::spawn_blocking(move || -> std::io::Result<(u64, u64, u64)> {
+                let queue_us = queued.elapsed().as_micros() as u64;
+                let start = std::time::Instant::now();
+                if !seed.is_empty() { write_entropy_sync(&seed)?; }
+                let entropy_us = start.elapsed().as_micros() as u64;
+                let start = std::time::Instant::now();
+                if let Some(state) = certificate { crate::tcp_template::check_frozen(&state)?; }
+                else { crate::tcp_reset::reset()?; }
+                Ok((queue_us, entropy_us, start.elapsed().as_micros() as u64))
+            });
+            let mut handle = self.handle.lock().await;
+            // join! (not try_join!) drains the blocking job even if lookup fails.
+            // A failed lookup never races later cleanup with a released gate.
+            let (cleaned, link) = tokio::join!(cleanup, handle.find_fork_interface(&req.old_mac, &req.interfaces));
+            let (queue_us, entropy_us, tcp_us) = cleaned
+                .map_err(|e| Error::Other(format!("identity cleanup worker failed: {}", e)))?
+                .map_err(|e| Error::Other(format!("identity cleanup failed: {}", e)))?;
+            let link = link?;
+            mark("cleanup_and_link_lookup");
+            identity_work = Some((queue_us, entropy_us, tcp_us));
+            handle.apply_fork_interface(req.interfaces.clone(), link).await?;
+            mark("interface");
+            handle.update_routes(req.routes.clone()).await?;
+            mark("routes");
+        } else if !req.entropy.is_empty() {
+            write_entropy(&req.entropy).await?;
+            mark("entropy");
+        }
+        if req.release {
+            // Transport reset can leave old-CID vsock readers asleep in epoll.
+            // Wake only registered, already-disconnected sockets; their owners
+            // perform cancellation and close. Newly connected RPCs stay alive.
+            let count = self
+                .connections
+                .wake_disconnected()
+                .map_err(|e| Error::Other(format!("wake reset RPC transports: {}", e)))?;
+            debug!("fork woke {} disconnected RPC transports", count);
+        }
+        if req.release {
+            self.tcp_template.release(&req.token).await?;
+            mark("template_thaw");
+        }
+        self.fork_gate.control(&req.token, req.release).await?;
+        let mut response = api::sandbox::ForkControlResponse::new();
+        response.entropy_applied = !req.entropy.is_empty();
+        response.tcp_scan_skipped = reset_network && skip_tcp;
+        if req.prepare_tcp_empty {
+            response.tcp_empty_verified = self.tcp_template.prepare(&req.token).await?;
+        }
+        mark("release");
+        if let Some((queue_us, entropy_us, tcp_us)) = identity_work {
+            // Submeasurements overlap cleanup_and_link_lookup; do not sum them.
+            timing.extend([("worker_queue".into(), queue_us),
+                           ("entropy_work".into(), entropy_us),
+                           ("tcp_reset_work".into(), tcp_us)]);
+        }
+        if req.release {
+            response.timing_json = serde_json::to_string(&timing).unwrap_or_default();
+        }
+        if !req.release {
+            let containers = self.containers.lock().await;
+            for (id, c) in containers.iter() {
+                response.containers.push(api::sandbox::ForkContainer {
+                    id: id.clone(),
+                    pid: c.init.pid as u32,
+                    processes: c
+                        .processes
+                        .iter()
+                        .map(|(id, p)| api::sandbox::ForkProcess {
+                            id: id.clone(),
+                            pid: p.pid as u32,
+                            ..Default::default()
+                        })
+                        .collect(),
+                    ..Default::default()
+                });
+            }
+        }
+        Ok(response)
+    }
+
     async fn update_interfaces(
         &self,
         _ctx: &TtrpcContext,
@@ -128,6 +247,7 @@ impl api::sandbox_ttrpc::SandboxService for SandboxService {
         _ctx: &TtrpcContext,
         req: SetupSandboxRequest,
     ) -> TtrpcResult<Empty> {
+        let _fork_guard = self.fork_gate.enter()?;
         match req.config.type_url.as_str() {
             "PodSandboxConfig" => {
                 let config =
@@ -170,11 +290,70 @@ impl api::sandbox_ttrpc::SandboxService for SandboxService {
         _ctx: &TtrpcContext,
         req: ExecVMProcessRequest,
     ) -> TtrpcResult<ExecVMProcessResponse> {
-        let out = do_execute_cmd(&req.command, req.stdin.as_slice()).await?;
-
+        let _exec_guard = self.tcp_template.exec_gate.clone().try_read_owned()
+            .map_err(|_| ttrpc::Error::Others("template workload is frozen".into()))?;
+        let (out, stderr, code, timing) = execute_result(&req).await?;
         let mut resp = ExecVMProcessResponse::new();
         resp.out = out;
+        if req.structured_output {
+            resp.stderr = stderr;
+            resp.exit_code = code;
+            resp.pid = timing.pid;
+            resp.structured_output = true;
+        }
+        if req.profile {
+            resp.timing_json =
+                serde_json::to_string(&timing).map_err(|e| Error::Other(e.to_string()))?;
+        }
         Ok(resp)
+    }
+
+    async fn exec_vm_process_streaming(
+        &self,
+        _ctx: &TtrpcContext,
+        req: ExecVMProcessRequest,
+        stream: ttrpc::r#async::ServerStreamSender<api::sandbox::ExecVMProcessEvent>,
+    ) -> TtrpcResult<()> {
+        let exec_guard = self.tcp_template.exec_gate.clone().try_read_owned()
+            .map_err(|_| ttrpc::Error::Others("template workload is frozen".into()))?;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        // Keep draining/reaping even if the transport is cancelled. The bounded
+        // channel closes on disconnect; no output accumulates for absent clients.
+        let running = tokio::spawn(async move {
+            let _exec_guard = exec_guard;
+            let mut cmd = process_command(&req.command, &req.argv)?;
+            cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+            cmd.stdin(if req.stdin.is_empty() { Stdio::null() } else { Stdio::piped() });
+            let mut timing = crate::util::ProcessTiming::default();
+            let (_, _, code) = crate::util::spawn_and_wait_stream(
+                cmd, &req.stdin, Some(&mut timing), Some(&tx)).await?;
+            Ok::<_, Error>((code, timing, req.profile))
+        });
+        let mut transport_error = None;
+        while let Some(event) = rx.recv().await {
+            let mut response = api::sandbox::ExecVMProcessEvent::new();
+            match event {
+                crate::util::ProcessEvent::Start(pid) => response.pid = pid,
+                crate::util::ProcessEvent::Stdout(bytes) => response.stdout = bytes,
+                crate::util::ProcessEvent::Stderr(bytes) => response.stderr = bytes,
+            }
+            if let Err(error) = stream.send(&response).await {
+                transport_error = Some(error);
+                break;
+            }
+        }
+        drop(rx);
+        let (code, timing, profile) = running.await
+            .map_err(|e| Error::Other(format!("process worker failed: {e}")))??;
+        if let Some(error) = transport_error { return Err(error); }
+        let mut response = api::sandbox::ExecVMProcessEvent::new();
+        response.exited = true;
+        response.exit_code = code;
+        if profile {
+            response.timing_json = serde_json::to_string(&timing)
+                .map_err(|e| Error::Other(e.to_string()))?;
+        }
+        stream.send(&response).await
     }
 
     async fn sync_clock(
@@ -205,14 +384,13 @@ impl api::sandbox_ttrpc::SandboxService for SandboxService {
     }
 
     async fn get_events(&self, _ctx: &TtrpcContext, _: Empty) -> TtrpcResult<Envelope> {
-        while let Some((topic, event)) = self.rx.lock().await.recv().await {
+        // Freeze actively cancels an idle poll, but still waits for its read
+        // guard to drain before RAM can be forked. The normal timeout stays 200 ms.
+        let event = self.fork_gate.wait_event(&self.rx).await?;
+        if let Some((topic, event)) = event {
             debug!("received event {:?}", event);
-            // Only OOM Event is supported.
-            // TODO: Support all topic
-            if topic != TASK_OOM_EVENT_TOPIC {
-                continue;
-            }
-
+            // Forward the full Task lifecycle. The host scopes these events to
+            // the containerd namespace bound to this particular VM instance.
             let mut resp = Envelope::new();
             resp.set_timestamp(SystemTime::now().into());
             resp.set_namespace(self.namespace.to_string());
@@ -229,17 +407,7 @@ impl api::sandbox_ttrpc::SandboxService for SandboxService {
         _ctx: &TtrpcContext,
         req: ReseedEntropyRequest,
     ) -> TtrpcResult<Empty> {
-        use tokio::io::AsyncWriteExt;
-        tokio::fs::OpenOptions::new()
-            .write(true)
-            .open("/dev/urandom")
-            .await
-            .map_err(|e| ttrpc::Error::Others(format!("reseed_entropy: open /dev/urandom: {}", e)))?
-            .write_all(&req.seed)
-            .await
-            .map_err(|e| {
-                ttrpc::Error::Others(format!("reseed_entropy: write /dev/urandom: {}", e))
-            })?;
+        write_entropy(&req.seed).await?;
         Ok(Empty::new())
     }
 
@@ -248,6 +416,7 @@ impl api::sandbox_ttrpc::SandboxService for SandboxService {
         _ctx: &TtrpcContext,
         req: InjectTaskRequest,
     ) -> TtrpcResult<InjectTaskResponse> {
+        let _fork_guard = self.fork_gate.enter()?;
         use std::time::Duration;
 
         use tokio::time::timeout;
@@ -494,6 +663,7 @@ impl api::sandbox_ttrpc::SandboxService for SandboxService {
         _ctx: &TtrpcContext,
         req: AdoptContainerRequest,
     ) -> TtrpcResult<AdoptContainerResponse> {
+        let _fork_guard = self.fork_gate.enter()?;
         // Read PID and remove the orphan atomically under a single lock to avoid TOCTOU.
         let orphan_pid = {
             let mut containers = self.containers.lock().await;
@@ -890,32 +1060,118 @@ async fn check_one_target(
     }
 }
 
-async fn do_execute_cmd(cmd_args: &str, stdin: &[u8]) -> Result<String> {
-    let mut cmd = std::process::Command::new("/bin/bash");
-    cmd.arg("-c");
-    cmd.arg(cmd_args);
+fn write_entropy_sync(seed: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    std::fs::OpenOptions::new().write(true).open("/dev/urandom")?.write_all(seed)
+}
+
+async fn write_entropy(seed: &[u8]) -> TtrpcResult<()> {
+    let seed = seed.to_vec();
+    // Await the actual kernel write, not an async File's buffered write. One
+    // blocking job replaces separate open/write scheduling hops.
+    tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+        write_entropy_sync(&seed)
+    }).await.map_err(|e| ttrpc::Error::Others(format!("reseed_entropy join: {e}")))?
+      .map_err(|e| ttrpc::Error::Others(format!("reseed_entropy write: {e}")))?;
+    Ok(())
+}
+
+fn process_command(command: &str, argv: &[String]) -> Result<std::process::Command> {
+    if argv.is_empty() {
+        let mut cmd = std::process::Command::new("/bin/bash");
+        cmd.args(["-c", command]);
+        return Ok(cmd);
+    }
+    if !command.is_empty() || argv[0].is_empty() {
+        return Err(Error::Other(
+            "Specify either command or a nonempty argv executable".into(),
+        ));
+    }
+    let mut cmd = std::process::Command::new(&argv[0]);
+    cmd.args(&argv[1..]);
+    Ok(cmd)
+}
+
+async fn execute_result(
+    req: &ExecVMProcessRequest,
+) -> Result<(String, String, i32, crate::util::ProcessTiming)> {
+    let mut cmd = process_command(&req.command, &req.argv)?;
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-    if !stdin.is_empty() {
+    if !req.stdin.is_empty() {
         cmd.stdin(Stdio::piped());
+    } else if req.structured_output {
+        cmd.stdin(Stdio::null());
     }
-
-    let (stdout, stderr, exit_code) = spawn_and_wait(cmd, stdin).await?;
-
-    if exit_code == 0 {
-        Ok(stdout)
-    } else {
-        Err(containerd_shim::other!(
-            "cmd {} failed with exit code {} and error message {}",
-            cmd_args,
-            exit_code,
-            stderr
-        ))
+    let mut timing = crate::util::ProcessTiming::default();
+    let (stdout, stderr, code) = crate::util::spawn_and_wait_profile(
+        cmd,
+        &req.stdin,
+        (req.profile || req.structured_output).then_some(&mut timing),
+    )
+    .await?;
+    if code != 0 && !req.structured_output {
+        return Err(Error::Other(format!(
+            "Command failed with exit code {code}: {stderr}"
+        )));
     }
+    Ok((stdout, stderr, code, timing))
+}
+
+#[cfg(test)]
+async fn execute_request(
+    req: &ExecVMProcessRequest,
+) -> Result<(String, crate::util::ProcessTiming)> {
+    execute_result(req)
+        .await
+        .map(|(out, _, _, timing)| (out, timing))
+}
+
+#[cfg(test)]
+async fn do_execute_cmd(cmd_args: &str, stdin: &[u8]) -> Result<String> {
+    let req = ExecVMProcessRequest {
+        command: cmd_args.into(),
+        stdin: stdin.to_vec(),
+        ..Default::default()
+    };
+    execute_request(&req).await.map(|(out, _)| out)
 }
 
 #[cfg(test)]
 mod tests {
     use super::do_execute_cmd;
+
+    #[tokio::test]
+    async fn structured_exit_retains_pid_and_separate_stderr() {
+        let mut req = super::ExecVMProcessRequest {
+            argv: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "printf out; printf err >&2; exit 7".into(),
+            ],
+            structured_output: true,
+            ..Default::default()
+        };
+        let (out, err, code, timing) = super::execute_result(&req).await.unwrap();
+        assert_eq!((out.as_str(), err.as_str(), code), ("out", "err", 7));
+        assert!(timing.pid > 0);
+        req.structured_output = false;
+        assert!(super::execute_result(&req).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn direct_argv_is_literal_and_profile_covers_output() {
+        let req = super::ExecVMProcessRequest {
+            argv: vec!["/bin/echo".into(), "$(not-a-shell); $HOME".into()],
+            profile: true,
+            ..Default::default()
+        };
+        let (out, timing) = super::execute_request(&req).await.unwrap();
+        assert_eq!(out, "$(not-a-shell); $HOME\n");
+        assert!(timing.first_stdout_us > 0);
+        assert!(timing.total_us >= timing.first_stdout_us);
+        assert!(super::process_command("echo bad", &req.argv).is_err());
+        assert!(super::process_command("", &[String::new()]).is_err());
+    }
 
     #[tokio::test]
     async fn test_do_execute_cmd_table() {

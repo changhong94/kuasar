@@ -62,9 +62,12 @@ mod config;
 mod container;
 mod debug;
 mod device;
+mod fork;
 mod io;
 mod mount;
 mod netlink;
+mod tcp_reset;
+mod tcp_template;
 mod sandbox;
 mod sandbox_service;
 mod stream;
@@ -441,18 +444,25 @@ async fn mount_static_mounts(mounts: Vec<StaticMount>) -> Result<()> {
 // create_ttrpc_server will create all the ttrpc service and register them to a server that
 // bind to vsock 1024 port.
 async fn create_ttrpc_server() -> anyhow::Result<Server> {
+    let server = Server::new();
     let (tx, rx) = channel(128);
     let (task, sandbox_resources) = create_task_service(tx).await?;
     let containers = task.containers.clone();
-    let task_service = create_task(Arc::new(Box::new(task)));
+    let gate = Arc::new(fork::ForkGate::default());
+    let task_service = create_task(Arc::new(Box::new(fork::ForkableTask {
+        inner: task,
+        gate: gate.clone(),
+    })));
 
-    let sandbox = SandboxService::new(rx, containers, sandbox_resources)?;
+    let mut sandbox = SandboxService::new(rx, containers, sandbox_resources)?;
+    sandbox.fork_gate = gate;
+    sandbox.connections = server.connection_tracker();
     sandbox.handle_localhost().await?;
     let sandbox_service = create_sandbox_service(Arc::new(Box::new(sandbox)));
 
     let streaming_service = create_streaming(Arc::new(Box::new(STREAMING_SERVICE.clone())));
 
-    Ok(Server::new()
+    Ok(server
         .bind("vsock://-1:1024")?
         .register_service(task_service)
         .register_service(sandbox_service)

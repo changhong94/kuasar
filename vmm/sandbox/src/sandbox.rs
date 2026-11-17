@@ -400,6 +400,13 @@ pub(crate) struct RestoreMetadata {
     pub(crate) orphan_container_ids: Vec<String>,
 }
 
+/// Runtime-only reservation. Keeping the namespace open prevents inode reuse;
+/// reservations intentionally expire when the sandboxer restarts.
+pub(crate) struct PreparedFork {
+    pub(crate) token: String,
+    pub(crate) namespace: Option<std::fs::File>,
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct KuasarSandbox<V: VM> {
     pub(crate) vm: V,
@@ -421,6 +428,8 @@ pub struct KuasarSandbox<V: VM> {
     pub(crate) storage_policy: ContainerStoragePolicy,
     #[serde(default)]
     pub(crate) restore: RestoreMetadata,
+    #[serde(skip)]
+    pub(crate) prepared_fork: Option<PreparedFork>,
 }
 
 /// Parsed snapshot-restore intent from a sandbox's pod annotations.
@@ -480,6 +489,7 @@ where
             sandbox_cgroups,
             storage_policy: self.factory.storage_policy(),
             restore: RestoreMetadata::default(),
+            prepared_fork: None,
         };
 
         // setup sandbox files: hosts, hostname and resolv.conf for guest
@@ -495,6 +505,9 @@ where
 
     #[instrument(skip_all)]
     async fn start(&self, id: &str) -> Result<()> {
+        if self.sandbox(id).await?.lock().await.prepared_fork.is_some() {
+            return Err(anyhow!("prepared slot must be activated with sandbox-fork").into());
+        }
         if self.template_pool.is_some() || self.continuation_store.is_some() {
             if self.config.snapshot.enable_warmfork_restore
                 || self.config.snapshot.enable_continuation_restore
@@ -632,6 +645,9 @@ where
 
         let sandbox_mutex = self.sandbox(id).await?;
         let mut sandbox = sandbox_mutex.lock().await;
+        if sandbox.prepared_fork.is_some() {
+            return Err(anyhow!("prepared slot must be activated with sandbox-fork").into());
+        }
         self.apply_pool_settings(&mut sandbox);
         self.hooks.pre_start(&mut sandbox).await?;
 
@@ -999,6 +1015,12 @@ where
 
     #[instrument(skip_all)]
     async fn append_container(&mut self, id: &str, options: ContainerOption) -> Result<()> {
+        if self.vm.live_fork_profile() && !self.vm.live_fork_agent() {
+            return Err(anyhow!(
+                "live_fork is a VM-only sandbox profile; guest task transport is not supported"
+            )
+            .into());
+        }
         let handler_chain = self.container_append_handlers(id, options)?;
         handler_chain.handle(self).await?;
         self.dump().await?;
@@ -1342,12 +1364,20 @@ where
                 }
                 return Err(e);
             }
-            sb.sync_clock().await;
-            sb.forward_events().await;
+            if !sb.vm.live_fork_profile() {
+                sb.sync_clock().await;
+            }
+            if !sb.vm.live_fork_profile() || sb.vm.live_fork_agent() {
+                sb.forward_events().await;
+            }
         }
         // recover the sandbox_cgroups in the sandbox object
-        sb.sandbox_cgroups =
-            SandboxCgroup::create_sandbox_cgroups(&sb.sandbox_cgroups.cgroup_parent_path, &sb.id)?;
+        if !sb.vm.live_fork_profile() {
+            sb.sandbox_cgroups = SandboxCgroup::create_sandbox_cgroups(
+                &sb.sandbox_cgroups.cgroup_parent_path,
+                &sb.id,
+            )?;
+        }
 
         info!(
             "recover sandbox {} takes {}ms",
@@ -1363,8 +1393,16 @@ where
     V: VM + Sync + Send,
 {
     #[instrument(skip_all)]
-    async fn start(&mut self) -> Result<()> {
+    pub(crate) async fn start(&mut self) -> Result<()> {
+        if self.prepared_fork.is_some() {
+            return Err(anyhow!("prepared slot must be activated with sandbox-fork").into());
+        }
         let pid = self.vm.start().await?;
+        if self.vm.live_fork_profile() && !self.vm.live_fork_agent() {
+            self.data.task_address.clear();
+            self.status = SandboxStatus::Running(pid);
+            return Ok(());
+        }
 
         if let Err(e) = self.init_client().await {
             if let Err(re) = self.vm.stop(true).await {
@@ -1401,7 +1439,15 @@ where
     }
 
     #[instrument(skip_all)]
-    pub(crate) async fn stop(&mut self, mut force: bool) -> Result<()> {
+    pub(crate) async fn stop(&mut self, force: bool) -> Result<()> {
+        self.stop_vm(force).await?;
+        self.destroy_network().await;
+        Ok(())
+    }
+
+    /// Finish VM/lifecycle teardown before independently cleaning its host network.
+    pub(crate) async fn stop_vm(&mut self, mut force: bool) -> Result<()> {
+        self.prepared_fork = None;
         match self.status {
             // If a sandbox is created:
             // 1. Just Created, vmm is not running: roll back and cleanup
@@ -1415,8 +1461,6 @@ where
             }
             SandboxStatus::Running(_) => {}
             SandboxStatus::Stopped(_, _) => {
-                // Network should already be destroyed when sandbox is stopped.
-                self.destroy_network().await;
                 return Ok(());
             }
             _ => {
@@ -1439,7 +1483,11 @@ where
         }
 
         self.vm.stop(force).await?;
-        self.destroy_network().await;
+        if self.vm.live_fork_profile() {
+            self.status =
+                SandboxStatus::Stopped(0, time::OffsetDateTime::now_utc().unix_timestamp_nanos());
+            self.exit_signal.signal();
+        }
         Ok(())
     }
 
@@ -1457,7 +1505,7 @@ where
     }
 
     #[instrument(skip_all)]
-    async fn init_client(&mut self) -> Result<()> {
+    pub(crate) async fn init_client(&mut self) -> Result<()> {
         let mut client_guard = self.client.lock().await;
         if client_guard.is_none() {
             let addr = self.vm.socket_address();
@@ -1470,11 +1518,300 @@ where
         Ok(())
     }
 
+    pub(crate) async fn fork_agent_control(
+        &self,
+        token: &str,
+        release: bool,
+    ) -> Result<vmm_common::api::sandbox::ForkControlResponse> {
+        let guard = self.client.lock().await;
+        let client = guard
+            .as_ref()
+            .ok_or_else(|| anyhow!("fork requires a connected agent"))?;
+        client
+            .fork_control(
+                ttrpc::context::with_timeout(15_000_000_000),
+                &vmm_common::api::sandbox::ForkControlRequest {
+                    token: token.to_owned(),
+                    release,
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(|e| anyhow!("agent fork barrier: {}", e).into())
+    }
+
+    pub(crate) async fn fork_agent_prepare_template(&self, token: &str) -> Result<bool> {
+        let guard = self.client.lock().await;
+        let client = guard.as_ref().ok_or_else(|| anyhow!("missing template agent"))?;
+        let response = client.fork_control(ttrpc::context::with_timeout(15_000_000_000),
+            &vmm_common::api::sandbox::ForkControlRequest {
+                token: token.into(), prepare_tcp_empty: true, ..Default::default()
+            }).await.map_err(|e| anyhow!("prepare template TCP certificate: {e}"))?;
+        Ok(response.tcp_empty_verified)
+    }
+
+    pub(crate) async fn fork_agent_release_network(
+        &self,
+        token: &str,
+        parent: Option<&Network>,
+        seed: Option<&[u8]>,
+    ) -> Result<()> {
+        let guard = self.client.lock().await;
+        let client = guard.as_ref().ok_or_else(|| anyhow!("missing child agent"))?;
+        self.fork_agent_release_network_with_client(client, token, parent, seed, false).await
+    }
+
+    pub(crate) async fn fork_agent_release_network_with_client(
+        &self,
+        client: &SandboxServiceClient,
+        token: &str,
+        parent: Option<&Network>,
+        seed: Option<&[u8]>,
+        skip_tcp_if_certified: bool,
+    ) -> Result<()> {
+        let mut request = vmm_common::api::sandbox::ForkControlRequest {
+            token: token.into(),
+            release: true,
+            skip_tcp_if_certified,
+            entropy: seed.unwrap_or_default().to_vec(),
+            ..Default::default()
+        };
+        if let (Some(old), Some(new)) = (parent, self.network.as_ref()) {
+            if old.interfaces().len() != 1 || new.interfaces().len() != 1 {
+                return Err(anyhow!("fork supports one NIC").into());
+            }
+            request.old_mac = old.interfaces()[0].mac_address.to_string();
+            request.interfaces = new.interfaces().iter().map(|i| i.into()).collect();
+            request.routes = new.routes().iter().map(|r| r.into()).collect();
+        }
+        let response = client.fork_control(ttrpc::context::with_timeout(15_000_000_000), &request)
+            .await
+            .map_err(|e| anyhow!("reset child network: {}", e))?;
+        info!("FORK_TCP_CERTIFICATE {} requested={} skipped={}", self.id, skip_tcp_if_certified, response.tcp_scan_skipped);
+        if !response.timing_json.is_empty() {
+            info!("FORK_GUEST_PHASE {} {}", self.id, response.timing_json);
+        }
+        if let Some(seed) = seed {
+            if !response.entropy_applied {
+                // Compatibility with agents predating the combined operation.
+                // Still complete entropy injection before exposing the sandbox.
+                client_reseed_entropy(client, seed).await?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn finish_deferred_network(&mut self) -> Result<()> {
+        let old_mac = match self
+            .network
+            .as_ref()
+            .and_then(|n| n.deferred_old_mac.clone())
+        {
+            Some(mac) => mac,
+            None => return Ok(()),
+        };
+        self.network.as_mut().unwrap().stage_deferred().await?;
+        let network = self.network.as_ref().unwrap();
+        let request = vmm_common::api::sandbox::ForkControlRequest {
+            token: format!("network-{}", self.id),
+            release: true,
+            old_mac,
+            interfaces: network.interfaces().iter().map(|i| i.into()).collect(),
+            routes: network.routes().iter().map(|r| r.into()).collect(),
+            ..Default::default()
+        };
+        let result = self
+            .client
+            .lock()
+            .await
+            .as_ref()
+            .ok_or_else(|| anyhow!("missing child agent"))?
+            .fork_control(ttrpc::context::with_timeout(15_000_000_000), &request)
+            .await;
+        if let Err(error) = result {
+            // The isolated TAP remains disconnected. Release only our lifecycle
+            // token on failure, so an identity error does not strand task RPCs.
+            let _ = self.fork_agent_control(&request.token, true).await;
+            return Err(anyhow!("complete deferred guest network: {}", error).into());
+        }
+        // Persist the chosen addresses before connecting the isolated TAP.
+        self.dump().await?;
+        self.network.as_ref().unwrap().connect_deferred().await?;
+        self.network.as_mut().unwrap().deferred_old_mac = None;
+        self.dump().await?;
+        Ok(())
+    }
+
+    pub(crate) fn validate_fork_inventory(
+        &self,
+        inventory: &vmm_common::api::sandbox::ForkControlResponse,
+    ) -> Result<()> {
+        if inventory.containers.len() != self.containers.len() {
+            return Err(anyhow!("host and guest container inventory differ").into());
+        }
+        for task in &inventory.containers {
+            let host = self
+                .containers
+                .get(&task.id)
+                .ok_or_else(|| anyhow!("unregistered guest task {}", task.id))?;
+            let mut expected: Vec<_> = host.processes.iter().map(|p| p.id.as_str()).collect();
+            let mut actual: Vec<_> = task.processes.iter().map(|p| p.id.as_str()).collect();
+            expected.sort_unstable();
+            actual.sort_unstable();
+            if expected != actual {
+                return Err(anyhow!("host and guest exec inventory differ for {}", task.id).into());
+            }
+        }
+        Ok(())
+    }
+
+    /// Copy only owned host metadata. Guest bundles, runc state, processes and
+    /// agent Task objects remain in inherited RAM; never Create/Start/adopt them.
+    pub(crate) async fn inherit_fork_metadata(&mut self, parent: &Self) -> Result<()> {
+        let valid_id = |id: &str| {
+            !id.is_empty()
+                && id != "."
+                && id != ".."
+                && id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b))
+        };
+        let empty_io = |io: &containerd_sandbox::data::Io| {
+            !io.terminal && io.stdin.is_empty() && io.stdout.is_empty() && io.stderr.is_empty()
+        };
+        if !parent.storages.is_empty() {
+            return Err(anyhow!("fork with attached storage is unsupported").into());
+        }
+        for (id, c) in &parent.containers {
+            if !valid_id(id)
+                || c.id != *id
+                || c.data
+                    .spec
+                    .as_ref()
+                    .and_then(|s| s.process.as_ref())
+                    .is_some_and(|p| p.terminal)
+                || !c.io_devices.is_empty()
+                || !c.data.rootfs.is_empty()
+                || c.data.io.as_ref().is_some_and(|io| !empty_io(io))
+                || c.processes.iter().any(|p| {
+                    !valid_id(&p.id)
+                        || !p.io_devices.is_empty()
+                        || p.data.process.as_ref().is_some_and(|p| p.terminal)
+                        || p.data.io.as_ref().is_some_and(|io| !empty_io(io))
+                })
+            {
+                return Err(anyhow!(
+                    "fork requires guest-resident rootfs and no external/terminal IO: {}",
+                    id
+                )
+                .into());
+            }
+        }
+        let mut data = parent.data.clone();
+        data.id = self.id.clone();
+        data.netns = self.data.netns.clone();
+        data.task_address.clear();
+        data.labels.remove("io.kuasar.containerd.namespace");
+        data.created_at = Some(std::time::SystemTime::now());
+        data.started_at = data.created_at;
+        data.exited_at = None;
+        data.labels.insert(
+            "io.kuasar.fork.event-namespace".into(),
+            format!("kuasar-fork-{}", self.id),
+        );
+        self.data = data;
+        self.id_generator = parent.id_generator;
+        self.containers = parent.containers.clone();
+        let shared = self.get_sandbox_shared_path();
+        for c in self.containers.values_mut() {
+            c.data.bundle = format!("{}/{}", shared, c.id);
+            tokio::fs::create_dir_all(&c.data.bundle).await?;
+            if let Some(spec) = &c.data.spec {
+                crate::utils::write_file_atomic(
+                    format!("{}/config.json", c.data.bundle),
+                    &serde_json::to_string(spec).map_err(|e| anyhow!(e))?,
+                )
+                .await?;
+            }
+            let mut ios = vec![(c.id.clone(), c.data.io.as_ref())];
+            ios.extend(
+                c.processes
+                    .iter()
+                    .map(|p| (format!("{}-{}", c.id, p.id), p.data.io.as_ref())),
+            );
+            for (id, io) in ios {
+                if let Some(io) = io {
+                    crate::utils::write_file_atomic(
+                        format!("{}/{}-{}", c.data.bundle, vmm_common::IO_FILE_PREFIX, id),
+                        &serde_json::to_string(io).map_err(|e| anyhow!(e))?,
+                    )
+                    .await?;
+                }
+            }
+            crate::utils::write_file_atomic(
+                format!(
+                    "{}/{}-{}",
+                    c.data.bundle,
+                    vmm_common::STORAGE_FILE_PREFIX,
+                    c.id
+                ),
+                "[]",
+            )
+            .await?;
+        }
+        self.dump().await?;
+        Ok(())
+    }
+
+    /// Keep a healthy connection on a rejected fork; after an actual restore,
+    /// replace the closed stream and its event subscription together.
+    pub(crate) async fn reconnect_fork_agent(&mut self) -> Result<()> {
+        let guard = self.client.lock().await;
+        if let Some(client) = guard.as_ref() {
+            if client
+                .check(
+                    ttrpc::context::with_timeout(1_000_000_000),
+                    &vmm_common::api::sandbox::CheckRequest::new(),
+                )
+                .await
+                .is_ok()
+            {
+                return Ok(());
+            }
+        }
+        drop(guard);
+        self.replace_fork_agent().await
+    }
+
+    /// A successful VM fork invalidates every old transport. Do not spend a
+    /// check timeout on a known obsolete stream before connecting to the new VM.
+    pub(crate) async fn replace_fork_agent(&mut self) -> Result<()> {
+        let client = self.prepare_fork_agent().await?;
+        self.install_fork_agent(client).await;
+        Ok(())
+    }
+
+    /// Open and check the new transport without publishing it or releasing the
+    /// frozen guest. This can overlap independent disk durability barriers.
+    pub(crate) async fn prepare_fork_agent(&self) -> Result<SandboxServiceClient> {
+        self.client.lock().await.take();
+        let address = self.vm.socket_address();
+        crate::client::reconnect_checked_sandbox_client(&address).await
+    }
+
+    pub(crate) async fn install_fork_agent(&mut self, client: SandboxServiceClient) {
+        *self.client.lock().await = Some(client);
+        self.forward_events().await;
+    }
+
     /// Use fail-fast connect strategy during recovery: if the guest agent
     /// socket returns a fatal error (e.g. broken pipe), bail out immediately
     /// instead of retrying until timeout.
     #[instrument(skip_all)]
     async fn init_client_fail_fast(&mut self) -> Result<()> {
+        if self.vm.live_fork_profile() && !self.vm.live_fork_agent() {
+            return self.vm.ping().await;
+        }
         let mut client_guard = self.client.lock().await;
         if client_guard.is_none() {
             let addr = self.vm.socket_address();
@@ -1926,16 +2263,47 @@ where
         if let Some(client) = &*self.client.lock().await {
             let client = client.clone();
             let exit_signal = self.exit_signal.clone();
+            let id_map_file = format!("{}/containerd-ids.json", self.base_dir);
+            let namespace_file = format!("{}/containerd-namespace", self.base_dir);
+            let event_namespace = self
+                .data
+                .labels
+                .get("io.kuasar.fork.event-namespace")
+                .cloned();
             tokio::spawn(async move {
                 let fut = async {
                     loop {
                         match client.get_events(with_timeout(0), &Empty::new()).await {
                             Ok(resp) => {
-                                if let Err(e) =
-                                    crate::client::publish_event(convert_envelope(resp)).await
+                                let mut envelope = convert_envelope(resp);
+                                if let Ok(raw) = tokio::fs::read(&id_map_file).await {
+                                    if let Ok(ids) = serde_json::from_slice(&raw) {
+                                        if let Err(e) = remap_fork_event(&mut envelope, &ids) {
+                                            error!("invalid fork event: {}", e);
+                                            continue;
+                                        }
+                                    }
+                                }
+                                if let Ok(namespace) =
+                                    tokio::fs::read_to_string(&namespace_file).await
                                 {
+                                    envelope.namespace = namespace;
+                                } else if let Some(namespace) = &event_namespace {
+                                    envelope.namespace = namespace.clone();
+                                }
+                                if let Err(e) = crate::client::publish_event(envelope).await {
                                     error!("{}", e);
                                 }
+                            }
+                            Err(ttrpc::Error::RpcStatus(status))
+                                if matches!(
+                                    status.code(),
+                                    ttrpc::Code::DEADLINE_EXCEEDED
+                                        | ttrpc::Code::FAILED_PRECONDITION
+                                ) =>
+                            {
+                                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                                continue;
                             }
                             Err(err) => {
                                 // if sandbox was closed, will get error Socket("early eof"),
@@ -1994,6 +2362,46 @@ pub fn has_shared_pid_namespace(data: &SandboxData) -> bool {
         }
     }
     false
+}
+
+fn remap_fork_event(envelope: &mut Envelope, ids: &HashMap<String, String>) -> anyhow::Result<()> {
+    use containerd_shim::protos::events::task::*;
+    use protobuf::Message;
+    let Some(any) = envelope.event.as_mut() else {
+        return Ok(());
+    };
+    macro_rules! remap {
+        ($ty:ty) => {{
+            let mut event = <$ty>::parse_from_bytes(&any.value)?;
+            if let Some(id) = ids.get(&event.container_id) {
+                event.container_id = id.clone();
+            }
+            any.value = event.write_to_bytes()?;
+        }};
+    }
+    match envelope.topic.as_str() {
+        "/tasks/create" => remap!(TaskCreate),
+        "/tasks/start" => remap!(TaskStart),
+        "/tasks/exec-added" => remap!(TaskExecAdded),
+        "/tasks/exec-started" => remap!(TaskExecStarted),
+        "/tasks/delete" => remap!(TaskDelete),
+        "/tasks/oom" => remap!(TaskOOM),
+        "/tasks/paused" => remap!(TaskPaused),
+        "/tasks/resumed" => remap!(TaskResumed),
+        "/tasks/checkpointed" => remap!(TaskCheckpointed),
+        "/tasks/exit" => {
+            let mut event = TaskExit::parse_from_bytes(&any.value)?;
+            if let Some(id) = ids.get(&event.container_id) {
+                if event.id == event.container_id {
+                    event.id = id.clone();
+                }
+                event.container_id = id.clone();
+            }
+            any.value = event.write_to_bytes()?;
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 fn convert_envelope(envelope: vmm_common::api::events::Envelope) -> Envelope {
@@ -2297,6 +2705,11 @@ pub(crate) fn monitor<V: VM + 'static>(sandbox_mutex: Arc<Mutex<KuasarSandbox<V>
             rx.changed().await.unwrap_or_default();
             let (code, ts) = *rx.borrow();
             let mut sandbox = sandbox_mutex.lock().await;
+            if sandbox.vm.live_fork_profile()
+                && matches!(sandbox.status, SandboxStatus::Stopped(_, _))
+            {
+                return;
+            }
             info!("monitor sandbox {} terminated", sandbox.id);
             sandbox.status = SandboxStatus::Stopped(code, ts);
             sandbox.exit_signal.signal();
@@ -2309,6 +2722,11 @@ pub(crate) fn monitor<V: VM + 'static>(sandbox_mutex: Arc<Mutex<KuasarSandbox<V>
                 .unwrap_or_default();
         } else {
             let mut sandbox = sandbox_mutex.lock().await;
+            if sandbox.vm.live_fork_profile()
+                && matches!(sandbox.status, SandboxStatus::Stopped(_, _))
+            {
+                return;
+            }
             info!("sandbox {} already terminated before monit it", sandbox.id);
             sandbox.status = SandboxStatus::Stopped(code, ts);
             sandbox.exit_signal.signal();
@@ -2649,6 +3067,7 @@ where
             continuation_store: self.continuation_store.clone(),
             snapshot_config: self.config.snapshot.clone(),
             sandbox_base_dir: dir.into(),
+            live_fork_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -3339,6 +3758,30 @@ where
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn fork_exit_events_map_container_but_preserve_exec_identity() {
+        use containerd_shim::protos::events::task::TaskExit;
+        use protobuf::Message;
+
+        use super::*;
+        let ids = HashMap::from([("guest".to_string(), "cri-id".to_string())]);
+        for (process, expected) in [("guest", "cri-id"), ("exec-worker", "exec-worker")] {
+            let mut event = TaskExit::new();
+            event.container_id = "guest".into();
+            event.id = process.into();
+            let mut envelope = Envelope::new();
+            envelope.topic = "/tasks/exit".into();
+            let mut any = protobuf::well_known_types::any::Any::new();
+            any.value = event.write_to_bytes().unwrap();
+            envelope.event = protobuf::MessageField::some(any);
+            remap_fork_event(&mut envelope, &ids).unwrap();
+            let result =
+                TaskExit::parse_from_bytes(&envelope.event.as_ref().unwrap().value).unwrap();
+            assert_eq!(result.container_id, "cri-id");
+            assert_eq!(result.id, expected);
+        }
+    }
+
     mod recovery {
         use std::{collections::HashMap, path::Path, sync::Arc};
 
@@ -3474,7 +3917,183 @@ mod tests {
                 sandbox_cgroups: SandboxCgroup::default(),
                 storage_policy: ContainerStoragePolicy::default(),
                 restore: RestoreMetadata::default(),
+                prepared_fork: None,
             }
+        }
+
+        #[tokio::test]
+        async fn prepared_slot_cannot_start_and_token_does_not_survive_serialization() {
+            let directory = TempDir::new().unwrap();
+            let mut sandbox = mock_sandbox(
+                directory.path().to_str().unwrap(),
+                SandboxStatus::Created,
+                MockVM::default(),
+            );
+            sandbox.prepared_fork = Some(super::super::PreparedFork {
+                token: "runtime-only-reservation".into(),
+                namespace: None,
+            });
+            assert!(sandbox
+                .start()
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("prepared slot must be activated"));
+            let json = serde_json::to_string(&sandbox).unwrap();
+            assert!(!json.contains("runtime-only-reservation"));
+            let restored: KuasarSandbox<MockVM> = serde_json::from_str(&json).unwrap();
+            assert!(restored.prepared_fork.is_none());
+        }
+
+        #[tokio::test]
+        async fn successful_fork_replaces_transport_without_probing_old_client() {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+
+            use vmm_common::api::{
+                empty::Empty,
+                sandbox::CheckRequest,
+                sandbox_ttrpc::{create_sandbox_service, SandboxService},
+            };
+            struct Agent(Arc<AtomicUsize>);
+            #[async_trait]
+            impl SandboxService for Agent {
+                async fn check(
+                    &self,
+                    _: &ttrpc::r#async::TtrpcContext,
+                    _: CheckRequest,
+                ) -> ttrpc::Result<Empty> {
+                    self.0.fetch_add(1, Ordering::SeqCst);
+                    Ok(Empty::new())
+                }
+            }
+            let directory = TempDir::new().unwrap();
+            let old_address = format!("unix://{}/old.sock", directory.path().display());
+            let new_address = format!("unix://{}/new.sock", directory.path().display());
+            let old_checks = Arc::new(AtomicUsize::new(0));
+            let new_checks = Arc::new(AtomicUsize::new(0));
+            let mut old_server = ttrpc::r#async::Server::new()
+                .bind(&old_address)
+                .unwrap()
+                .register_service(create_sandbox_service(Arc::new(Box::new(Agent(
+                    old_checks.clone(),
+                )))));
+            let mut new_server = ttrpc::r#async::Server::new()
+                .bind(&new_address)
+                .unwrap()
+                .register_service(create_sandbox_service(Arc::new(Box::new(Agent(
+                    new_checks.clone(),
+                )))));
+            old_server.start().await.unwrap();
+            new_server.start().await.unwrap();
+            let mut sandbox = mock_sandbox(
+                directory.path().to_str().unwrap(),
+                SandboxStatus::Running(1),
+                MockVM {
+                    socket_address: new_address,
+                    ..Default::default()
+                },
+            );
+            *sandbox.client.lock().await = Some(
+                crate::client::new_sandbox_client(&old_address)
+                    .await
+                    .unwrap(),
+            );
+            let prepared = sandbox.prepare_fork_agent().await.unwrap();
+            // Preparing a checked transport must not expose it before the
+            // independent durability gate has succeeded.
+            assert!(sandbox.client.lock().await.is_none());
+            sandbox.install_fork_agent(prepared).await;
+            assert_eq!(old_checks.load(Ordering::SeqCst), 0);
+            assert_eq!(new_checks.load(Ordering::SeqCst), 1);
+            // A failed/rejected fork still preserves an existing healthy client.
+            sandbox.reconnect_fork_agent().await.unwrap();
+            assert_eq!(new_checks.load(Ordering::SeqCst), 2);
+            sandbox.client.lock().await.take();
+            old_server.shutdown().await.unwrap();
+            new_server.shutdown().await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn live_fork_metadata_is_owned_and_inventory_checked() {
+            use containerd_sandbox::data::{ContainerData, Io, ProcessData};
+            use vmm_common::api::sandbox::{ForkContainer, ForkControlResponse, ForkProcess};
+
+            use crate::container::KuasarProcess;
+            let source_dir = TempDir::new().unwrap();
+            let child_dir = TempDir::new().unwrap();
+            let mut source = mock_sandbox(
+                source_dir.path().to_str().unwrap(),
+                SandboxStatus::Running(1),
+                MockVM::default(),
+            );
+            source.id = "source".into();
+            source.data.id = source.id.clone();
+            source.data.task_address = "parent-socket".into();
+            source.id_generator = 42;
+            source.containers.insert(
+                "container".into(),
+                KuasarContainer {
+                    id: "container".into(),
+                    data: ContainerData {
+                        id: "container".into(),
+                        bundle: "parent-bundle".into(),
+                        ..Default::default()
+                    },
+                    io_devices: vec![],
+                    processes: vec![KuasarProcess::new(ProcessData {
+                        id: "exec".into(),
+                        ..Default::default()
+                    })],
+                },
+            );
+            let inventory = ForkControlResponse {
+                containers: vec![ForkContainer {
+                    id: "container".into(),
+                    processes: vec![ForkProcess {
+                        id: "exec".into(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            source.validate_fork_inventory(&inventory).unwrap();
+            let mut wrong = inventory.clone();
+            wrong.containers[0].processes.clear();
+            assert!(source.validate_fork_inventory(&wrong).is_err());
+            assert!(source
+                .validate_fork_inventory(&ForkControlResponse::default())
+                .is_err());
+            let mut child = mock_sandbox(
+                child_dir.path().to_str().unwrap(),
+                SandboxStatus::Created,
+                MockVM::default(),
+            );
+            child.id = "child".into();
+            child.inherit_fork_metadata(&source).await.unwrap();
+            assert_eq!(child.data.id, "child");
+            assert!(child.data.task_address.is_empty());
+            assert_eq!(child.id_generator, 42);
+            assert_eq!(
+                child.data.labels["io.kuasar.fork.event-namespace"],
+                "kuasar-fork-child"
+            );
+            let bundle = &child.containers["container"].data.bundle;
+            assert!(bundle.starts_with(child_dir.path().to_str().unwrap()));
+            assert!(Path::new(bundle).exists());
+            child
+                .containers
+                .get_mut("container")
+                .unwrap()
+                .processes
+                .clear();
+            assert_eq!(source.containers["container"].processes.len(), 1);
+            assert_eq!(source.containers["container"].data.bundle, "parent-bundle");
+            source.containers.get_mut("container").unwrap().data.io = Some(Io {
+                stdout: "host-fifo".into(),
+                ..Default::default()
+            });
+            assert!(child.inherit_fork_metadata(&source).await.is_err());
         }
 
         async fn write_dump<P: AsRef<Path>>(dir: P, sandbox: &KuasarSandbox<MockVM>) {

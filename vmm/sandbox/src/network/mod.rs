@@ -47,6 +47,10 @@ pub struct Network {
     pub(crate) config: NetworkConfig,
     pub(crate) intfs: Vec<NetworkInterface>,
     routes: Vec<Route>,
+    #[serde(default)]
+    pub(crate) deferred_old_mac: Option<String>,
+    #[serde(default)]
+    deferred_parent_ips: Vec<String>,
 }
 
 async fn get_route(
@@ -122,6 +126,8 @@ impl Network {
             config,
             intfs,
             routes,
+            deferred_old_mac: None,
+            deferred_parent_ips: vec![],
         })
     }
 
@@ -133,6 +139,230 @@ impl Network {
             intf.attach_to(sandbox).await?;
         }
         sandbox.network = Some(me);
+        Ok(())
+    }
+
+    /// Restore the NIC on an isolated TAP. No CNI link exists yet, so guest
+    /// execution is safe even while the cloned network stack has its old identity.
+    pub async fn deferred<V: VM>(sandbox: &mut KuasarSandbox<V>, parent: &Network) -> Result<()> {
+        if parent.intfs.len() != 1 || parent.deferred_old_mac.is_some() {
+            return Err(anyhow!("deferred fork requires one ready source NIC").into());
+        }
+        let config = NetworkConfig {
+            netns: sandbox.data.netns.clone(),
+            sandbox_id: sandbox.id.clone(),
+            queue: parent.intfs[0].queue.max(1),
+        };
+        if config.netns.is_empty() || config.netns == parent.config.netns {
+            return Err(anyhow!("deferred fork requires a separate empty namespace").into());
+        }
+        use std::os::unix::fs::MetadataExt;
+        let a = std::fs::metadata(&config.netns)?;
+        let b = std::fs::metadata(&parent.config.netns)?;
+        if a.dev() == b.dev() && a.ino() == b.ino() {
+            return Err(anyhow!("parent and child namespaces must differ").into());
+        }
+        let empty = Self::new_from_netns(config.clone()).await?;
+        if !empty.intfs.is_empty() {
+            return Err(anyhow!("deferred namespace must initially be empty").into());
+        }
+        let handle = create_netlink_handle(&config.netns).await?;
+        let tap =
+            link::create_tap_in_netns(&config.netns, "forktap0", config.queue, parent.intfs[0].mtu, &handle)
+                .await?;
+        let mut mac: [u8; 6] = rand::random();
+        mac[0] = (mac[0] & 0xfe) | 0x02;
+        let mut intf = NetworkInterface {
+            name: "eth0".into(),
+            index: tap.index,
+            r#type: LinkType::Veth,
+            mac_address: address::MacAddress(mac.to_vec()),
+            mtu: parent.intfs[0].mtu,
+            queue: config.queue,
+            twin: Some(Box::new(tap)),
+            ..Default::default()
+        };
+        intf.attach_to(sandbox).await?;
+        sandbox.network = Some(Self {
+            config,
+            intfs: vec![intf],
+            routes: vec![],
+            deferred_old_mac: Some(parent.intfs[0].mac_address.to_string()),
+            deferred_parent_ips: parent.intfs[0]
+                .ip_addresses
+                .iter()
+                .map(|ip| ip.addr_string())
+                .collect(),
+        });
+        Ok(())
+    }
+
+    /// CNI owns eth0; adopt its addresses without replacing the already restored
+    /// TAP. No redirect is installed until the guest has acknowledged its identity.
+    pub async fn stage_deferred(&mut self) -> Result<()> {
+        if self.deferred_old_mac.is_none() {
+            return Ok(());
+        }
+        let mut fresh = Self::new_from_netns(self.config.clone()).await?;
+        if fresh.intfs.len() != 1
+            || fresh.intfs[0].name != "eth0"
+            || fresh.intfs[0].ip_addresses.is_empty()
+        {
+            return Err(anyhow!("CNI must supply exactly one addressed eth0").into());
+        }
+        if self.deferred_old_mac.as_deref() == Some(fresh.intfs[0].mac_address.to_string().as_str())
+        {
+            return Err(anyhow!("CNI returned the parent MAC address").into());
+        }
+        for ip in &fresh.intfs[0].ip_addresses {
+            if self.deferred_parent_ips.contains(&ip.addr_string()) {
+                return Err(anyhow!("CNI returned a parent IP address").into());
+            }
+        }
+        fresh.intfs[0].twin = self.intfs[0].twin.take();
+        self.intfs = fresh.intfs;
+        self.routes = fresh.routes;
+        Ok(())
+    }
+
+    pub async fn connect_deferred(&self) -> Result<()> {
+        let tap = &self.intfs[0]
+            .twin
+            .as_ref()
+            .ok_or_else(|| anyhow!("missing deferred TAP"))?
+            .name;
+        // Replace permits retry after partial setup. The outbound redirect is
+        // installed last, after anti-parent filters and guest identity update.
+        for name in [tap.as_str(), "eth0"] {
+            let mut cmd = std::process::Command::new("tc");
+            cmd.args(["qdisc", "replace", "dev", name, "ingress"]);
+            execute_in_netns(&self.config.netns, cmd).await?;
+        }
+        let mut cmd = std::process::Command::new("tc");
+        cmd.args([
+            "filter",
+            "replace",
+            "dev",
+            tap,
+            "ingress",
+            "pref",
+            "2",
+            "protocol",
+            "all",
+            "flower",
+            "src_mac",
+            self.deferred_old_mac
+                .as_ref()
+                .ok_or_else(|| anyhow!("network already connected"))?,
+            "action",
+            "drop",
+        ]);
+        execute_in_netns(&self.config.netns, cmd).await?;
+        for (i, ip) in self.deferred_parent_ips.iter().enumerate() {
+            let mut cmd = std::process::Command::new("tc");
+            cmd.args([
+                "filter",
+                "replace",
+                "dev",
+                tap,
+                "ingress",
+                "pref",
+                &(10 + i).to_string(),
+                "protocol",
+                if ip.contains(':') { "ipv6" } else { "ip" },
+                "flower",
+                "src_ip",
+                ip,
+                "action",
+                "drop",
+            ]);
+            execute_in_netns(&self.config.netns, cmd).await?;
+        }
+        for (from, to) in [("eth0", tap.as_str()), (tap.as_str(), "eth0")] {
+            let mut cmd = std::process::Command::new("tc");
+            cmd.args([
+                "filter", "replace", "dev", from, "ingress", "pref", "100", "matchall", "action",
+                "mirred", "egress", "redirect", "dev", to,
+            ]);
+            execute_in_netns(&self.config.netns, cmd).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn reject_parent_identity(&self, parent: &Network) -> Result<()> {
+        for interface in &self.intfs {
+            let tap = interface
+                .twin
+                .as_ref()
+                .ok_or_else(|| anyhow!("missing fork TAP"))?;
+            for old in &parent.intfs {
+                let mut cmd = std::process::Command::new("tc");
+                cmd.args([
+                    "filter",
+                    "add",
+                    "dev",
+                    &tap.name,
+                    "ingress",
+                    "pref",
+                    "2",
+                    "protocol",
+                    "all",
+                    "flower",
+                    "src_mac",
+                    &old.mac_address.to_string(),
+                    "action",
+                    "drop",
+                ]);
+                execute_in_netns(&self.config.netns, cmd).await?;
+                for ip in &old.ip_addresses {
+                    let mut cmd = std::process::Command::new("tc");
+                    let address = ip.addr_string();
+                    cmd.args([
+                        "filter",
+                        "add",
+                        "dev",
+                        &tap.name,
+                        "ingress",
+                        "pref",
+                        if address.contains(':') { "4" } else { "3" },
+                        "protocol",
+                        if address.contains(':') { "ipv6" } else { "ip" },
+                        "flower",
+                        "src_ip",
+                        &address,
+                        "action",
+                        "drop",
+                    ]);
+                    execute_in_netns(&self.config.netns, cmd).await?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The new TAP must not emit inherited packets before guest identity reset.
+    pub async fn fork_block(&self, block: bool) -> Result<()> {
+        for interface in &self.intfs {
+            let tap = interface
+                .twin
+                .as_ref()
+                .ok_or_else(|| anyhow!("fork networking requires a CNI veth/TAP pair"))?;
+            if block {
+                let mut cmd = std::process::Command::new("tc");
+                cmd.args([
+                    "filter", "add", "dev", &tap.name, "ingress", "pref", "1", "matchall",
+                    "action", "drop",
+                ]);
+                execute_in_netns(&self.config.netns, cmd).await?;
+            } else {
+                let handle = create_netlink_handle(&self.config.netns).await?;
+                let link = handle.link().get().match_name(tap.name.clone()).execute()
+                    .try_next().await.map_err(|e| anyhow!("resolve fork TAP: {e}"))?
+                    .ok_or_else(|| anyhow!("fork TAP disappeared"))?;
+                netlink::delete_fork_drop_filter(handle, link.header.index).await
+                    .map_err(|e| anyhow!("release fork network barrier: {e}"))?;
+            }
+        }
         Ok(())
     }
 

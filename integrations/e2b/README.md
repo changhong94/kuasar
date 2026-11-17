@@ -317,9 +317,8 @@ a bound VM is never reassigned to a different tenant or image.
 This interface provides a Linux command environment from an application's
 filesystem. Legacy disk-only entries need a compatible architecture, `/bin/sh`, and the commands
 required by the SDK; a static busybox helper is supplied for SDK operations.
-Legacy disk-only entries do not start OCI ENTRYPOINT/CMD or apply OCI defaults;
-use the OCI import path below for those fields. Neither path restores a separate
-image-specific process checkpoint. The common
+Disk-only catalog entries are rejected: every image must use the OCI import
+path and carry execution configuration. The common
 guest kernel and runtime remain shared implementation choices. Per-image disk
 artifacts still require preparation, but no per-image VM pool is required.
 The writable overlay is guest RAM, matching the existing read-only-root research
@@ -331,18 +330,22 @@ fork path. Changing template ID in that request is rejected. Existing fork safet
 barriers, filesystem synchronization and durable assignment commits are retained.
 No `memory.img` or eager RAM copy is added. Network identities remain independent.
 Pool exhaustion returns an error after the existing bounded wait rather than
-silently returning the bare runtime. `E2B_FIXED_IMAGE` is a comparison-only mode:
-it binds one catalog image to the seed before pool preparation, and accepts only
-that image. Report its image binding and warmup as preparation costs.
+silently returning the bare runtime. `E2B_FIXED_IMAGE`, nonzero
+`E2B_TEMPLATE_READ_CACHE_BYTES`, and image-specific `startup_read_files` are
+rejected. There are no executable/library pre-read lists.
 
 ## OCI import and application startup
 
 `oci_import.py SOURCE --name IMAGE_ID --store DIR --catalog FILE` imports a
 skopeo transport (for example a digest-pinned `docker://` reference or an OCI
-layout). It resolves linux/amd64, verifies manifest/config/layer descriptors,
-unpacks whiteouts with umoci, constructs a read-only ext4 disk, and records both
+layout). It selects the host architecture (or explicit `--architecture`),
+requires Linux and verifies manifest/config/layer descriptors. It unpacks
+whiteouts with umoci, constructs a read-only disk, and records both
 manifest and config digests. It fsyncs the disk and metadata before atomically
 publishing the catalog under a file lock. Failed imports never publish an ID.
+All images use the same importer. `--filesystem ext4` is the default; optional
+`erofs` requires a mkfs.erofs supporting `--preserve-mtime`. The filesystem
+choice is explicit, never inferred from an image name or application files.
 The hidden path `/.__kuasar` is reserved for runtime file-operation helpers.
 
 The common runtime includes a statically linked `oci-launch` built from
@@ -371,14 +374,16 @@ Native process RPCs use image ENV/WORKDIR/USER defaults, with request environmen
 cwd and explicitly authenticated user overrides. SDK shell commands still need
 the requested shell in the image; a distroless image can use native argv instead.
 File RPCs use the reserved static helper, so they do not require image base64 or
-shell utilities. Legacy disk-only catalog entries retain the preceding command
-behavior and do not automatically start an OCI entrypoint.
+shell utilities. Catalog entries without OCI configuration must be reimported.
 
 After publishing a new immutable image ID, API-key-authenticated
 `POST /images/reload` with `{}` validates and adds it without draining or rebuilding
 any prepared VM. Existing IDs cannot be rebound or removed through this operation;
 use versioned IDs and retain artifacts referenced by running sandboxes. Validation
-runs outside the lifecycle lock; new file identities become visible before their
+runs outside the lifecycle lock. With preattached devices, cache copying, checksum
+verification and fsync finish before an ID is published; an import that exceeds
+the existing device capacity is rejected without rebuilding slots. New file
+identities become visible before their
 catalog entries. A running-parent fork inherits the saved OCI config, entrypoint
 PID, process state and writable overlay. It does not execute the entrypoint again.
 
@@ -464,7 +469,9 @@ persistent directory. This is a same-host, same-runtime-profile facility for
 read-only application disks; it does not change explicit live-parent fork.
 
 The adapter materializes each image once in a temporary builder sandbox. It
-mounts the image, runs the normal initialization, then asks
+mounts the image and optionally walks filesystem metadata with a zero file-read
+limit. It does **not** run ENTRYPOINT/CMD, an interpreter, or application code.
+It then asks
 `sandbox-snapshot-capture` to freeze the guest agent, pause the VM, save CPU,
 device and memory state, and take independently owned disk copies (reflinks
 where available). Files are sealed and synchronized before a manifest is
@@ -472,6 +479,9 @@ published and its directory synchronized. The builder is resumed and destroyed.
 A template is a set of files, not a parked VM or an image-specific VM pool.
 Cloud Hypervisor calls the memory file `memory-ranges`; it has the same role as
 a memory image. Template generation and host-cache warming are preparation costs.
+By default they run on the first request and are included in its latency.
+`E2B_EAGER_IMAGE_TEMPLATES=1` explicitly moves this work to service startup;
+report it separately. No application is started during either preparation mode.
 
 The existing single pool prepares network namespaces, CNI, endpoint identities,
 and VMM processes without selecting an application image. The
@@ -489,7 +499,10 @@ metadata (or stages it on a cache miss), and invokes
 `vm.restore` with `CopyOnWrite` and no full-memory prefault. Guest RAM is a
 private writable mapping of the immutable memory file. Restore, first guest
 faults, transport connection, entropy/network reset and final durable publication
-remain inside the measured create-to-command path. The required ForkControl
+remain inside the measured create-to-command path. OCI ENTRYPOINT/CMD executes
+after binding, before public lease publication; every fresh create uses the
+same ENV/WORKDIR/USER and startup semantics. Live-parent fork instead inherits
+the already-running processes and never restarts the entrypoint. The required ForkControl
 response checks guest responsiveness and its barrier token; an extra empty
 Check RPC is unnecessary. Event polling starts after identity reset. Network forwarding stays
 blocked until the restored guest has the slot's independent identity. Failure

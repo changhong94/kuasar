@@ -28,15 +28,23 @@ class SlotDiskTests(unittest.TestCase):
             self.assertTrue(paths[0].exists());self.assertFalse(paths[1].exists())
             disks.collect(set());self.assertFalse(paths[0].exists())
 
-@unittest.skipUnless(os.geteuid()==0 and os.environ.get('IMAGE_MOUNT_TEST_BINARY'), 'requires owned chroot and launcher')
-class CommandLauncherTests(unittest.TestCase):
-    def test_cwd_environment_literal_arguments_and_exit_status(self):
-        import shutil
-        import subprocess
-        with tempfile.TemporaryDirectory() as tmp:
-            root=Path(tmp);(root/'bin').mkdir();(root/'work').mkdir()
-            shutil.copy2(os.environ['OCI_TEST_BUSYBOX'], root/'bin/busybox')
-            result=subprocess.run([os.environ['IMAGE_MOUNT_TEST_BINARY'],'exec',tmp,'/work','1','VALUE=a b;$x',
-                '/bin/busybox','sh','-c','printf "%s|%s|%s" "$PWD" "$VALUE" "$1"; exit 17','probe','literal $(false)'],capture_output=True,text=True)
-            self.assertEqual(result.returncode,17)
-            self.assertEqual(result.stdout,'/work|a b;$x|literal $(false)')
+    def test_hot_added_image_binds_an_existing_device(self):
+        with tempfile.TemporaryDirectory(dir=os.environ['TEST_REFLINK_DIR']) as tmp:
+            root = Path(tmp)
+            first = root/'first'; first.write_bytes(b'A'*4096)
+            a = dict(disk=str(first), sha256=hashlib.sha256(first.read_bytes()).hexdigest())
+            disks = SlotDisks(root/'slots', {'a':a})
+            slot = disks.path/'e2b-existing.raw'; disks.create(slot)
+            second = root/'second'; second.write_bytes(b'B'*4096)
+            b = dict(disk=str(second), sha256=hashlib.sha256(second.read_bytes()).hexdigest())
+            disks.prepare_images([b]); disks.bind(slot, b)
+            with slot.open('rb') as f: self.assertEqual(f.read(4096), b'B'*4096)
+
+    def test_invalid_image_is_not_cached(self):
+        with tempfile.TemporaryDirectory(dir=os.environ['TEST_REFLINK_DIR']) as tmp:
+            root = Path(tmp); source=root/'image'; source.write_bytes(b'A'*4096)
+            a = dict(disk=str(source), sha256=hashlib.sha256(source.read_bytes()).hexdigest())
+            disks = SlotDisks(root/'slots', {'a':a})
+            bad = {**a, 'sha256':'0'*64}
+            with self.assertRaisesRegex(ValueError, 'checksum'): disks.prepare_images([bad])
+            self.assertFalse((disks.cache/('0'*64+'.raw')).exists())

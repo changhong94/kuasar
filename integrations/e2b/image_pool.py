@@ -44,33 +44,16 @@ def add_image_disk(api_socket, path):
         client.close()
 
 
-MOUNT_IMAGE = r'''set -e
+MOUNT_OCI_IMAGE = r'''set -e
 n=0
 while [ ! -b /dev/vdb ]; do
  n=$((n+1)); [ "$n" -lt 500 ]; /bin/busybox sleep 0.01
 done
 [ "$(/bin/busybox cat /sys/block/vdb/serial)" = app-root ]
 /bin/busybox mkdir -p /run/image-lower /run/image-upper /run/image-work /run/image-root
-/bin/busybox mount -t ext4 -o ro /dev/vdb /run/image-lower
+/bin/busybox mount -o ro /dev/vdb /run/image-lower
 /bin/busybox mount -t overlay overlay -o lowerdir=/run/image-lower,upperdir=/run/image-upper,workdir=/run/image-work /run/image-root
-if [ ! -e /run/image-root/bin/busybox ]; then
- /bin/busybox touch /run/image-root/bin/busybox
- helper=$(/bin/busybox readlink -f /run/image-root/bin/busybox)
- /bin/busybox mount --bind /bin/busybox "$helper"
- /bin/busybox mount -o remount,bind,ro /bin/busybox "$helper"
-fi
-/bin/busybox mkdir -p /run/image-root/.__kuasar /run/image-root/dev /run/image-root/proc /run/image-root/sys /run/image-root/run
-/bin/busybox touch /run/image-root/.__kuasar/busybox
-/bin/busybox mount --bind /bin/busybox /run/image-root/.__kuasar/busybox
-/bin/busybox mount -o remount,bind,ro /run/image-root/.__kuasar/busybox
-/bin/busybox mount --bind /dev /run/image-root/dev
-/bin/busybox mount --bind /proc /run/image-root/proc
-/bin/busybox mount --bind /sys /run/image-root/sys
-[ -x /run/image-root/bin/sh ]
-'''
-
-
-MOUNT_OCI_IMAGE = MOUNT_IMAGE[:MOUNT_IMAGE.index('if [ ! -e')]+r'''[ ! -L /run/image-root/.__kuasar ]
+[ ! -L /run/image-root/.__kuasar ]
 /bin/busybox mkdir -p /run/image-root/.__kuasar /run/image-root/dev /run/image-root/proc /run/image-root/sys
 for d in dev proc sys; do
  [ ! -L "/run/image-root/$d" ]
@@ -91,9 +74,7 @@ class ImagePoolBackend(VMBackend):
             raise ValueError('Default template is absent from the image catalog')
         self.image_stats = {}
         for key, image in self.image_catalog.items():
-            exec_cache.validate_startup_files(image.get("startup_read_files", []))
-            if 'oci_config' in image:
-                image['oci_config'] = normalize(image['oci_config'])
+            self.validate_image_config(image)
             path = Path(image['disk']).resolve(strict=True)
             if not path.is_file() or path.stat().st_mode & 0o222:
                 raise ValueError('Image disks must be immutable read-only regular files')
@@ -104,17 +85,10 @@ class ImagePoolBackend(VMBackend):
             st = path.stat()
             self.image_stats[key] = (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
         validation_ms = (time.monotonic()-started)*1000
-        self.fixed_template = os.environ.get('E2B_FIXED_IMAGE')
-        self.fixed_image_fields = {}
-        if self.fixed_template:
-            image = self.image_catalog[self.fixed_template]
-            source = vm_rpc.admin(args.admin_socket, 'sandbox-get', sandbox_id=args.source)
-            add_image_disk(source['live_fork']['api_socket'], image['disk'])
-            result = vm_rpc.execute(source['live_fork']['vsock_socket'], ['/bin/sh', '-c', MOUNT_IMAGE])
-            if result['exit_code']:
-                raise RuntimeError('Fixed comparison template binding failed: '+result['stderr'].decode(errors='replace'))
-            self.fixed_image_fields = dict(template_id=self.fixed_template, exec_root='/run/image-root',
-                image_manifest=image['manifest'], image_sha256=image['sha256'], image_disk=image['disk'])
+        if os.environ.get('E2B_FIXED_IMAGE'):
+            raise ValueError('Fixed-image pools are unsupported; import an OCI image instead')
+        if int(os.environ.get('E2B_TEMPLATE_READ_CACHE_BYTES', '0')):
+            raise ValueError('Application-file preloading is unsupported')
         self.slot_disks = None
         if os.environ.get("E2B_PREPARE_IMAGE_DEVICE") == "1":
             from slot_disk import SlotDisks
@@ -122,11 +96,27 @@ class ImagePoolBackend(VMBackend):
         self.snapshot_templates = {}
         self.snapshot_lock = threading.RLock()
         super().__init__(args)
-        if os.environ.get('E2B_SNAPSHOT_POOL') == '1':
+        if (os.environ.get('E2B_SNAPSHOT_POOL') == '1'
+                and os.environ.get('E2B_EAGER_IMAGE_TEMPLATES') == '1'):
             for key in self.image_catalog:
                 self.prepare_snapshot(key)
         Path(str(self.state)+'.catalog-preparation.json').write_text(json.dumps(dict(
             validation_ms=validation_ms, images=list(self.image_catalog)), indent=2))
+
+    @staticmethod
+    def validate_image_config(image):
+        if image.get('startup_read_files'):
+            raise ValueError('Image-specific startup reads are unsupported')
+        if 'oci_config' not in image:
+            raise ValueError('OCI configuration is required; reimport the image')
+        image['oci_config'] = normalize(image['oci_config'])
+
+    def start_entrypoint(self, sid, record):
+        # Called while the slot is private and its operation guard is held.
+        result = vm_rpc.execute(record['vsock_socket'], launch_argv(record['oci_config'], start=True))
+        if result['exit_code']:
+            raise RuntimeError('OCI entrypoint failed: '+result.get('stderr', b'').decode(errors='replace'))
+        record['entrypoint_pid'] = int(result['stdout'].strip())
 
     def prepare_snapshot(self, template):
         """One immutable file template per image; the VM slot pool remains shared."""
@@ -138,16 +128,14 @@ class ImagePoolBackend(VMBackend):
             sid = response['sandboxID']
             try:
                 info = self.admin('sandbox-get', sandbox_id=sid)['live_fork']
-                startup_cache = exec_cache.prepare_image(
-                    info['vsock_socket'], '/run/image-root',
-                    self.image_catalog[template].get('startup_read_files', []))
-                metadata_cache = (exec_cache.prepare_metadata(info['vsock_socket'], '/run/image-root',
-                                  int(os.environ.get('E2B_TEMPLATE_READ_CACHE_BYTES', '0')))
+                # Templates contain mounted filesystems and runtime state only.
+                # No application entrypoint, interpreter, or selected-file reads.
+                metadata_cache = (exec_cache.prepare_metadata(info['vsock_socket'], '/run/image-root')
                                   if os.environ.get('E2B_TEMPLATE_METADATA', '1') == '1' else None)
                 key = 'image-' + uuid.uuid4().hex
                 saved = self.admin('sandbox-snapshot-capture', sandbox_id=sid, template=key)
                 record = self.get(sid)
-                fields = {k: record[k] for k in ('exec_root', 'oci_config', 'entrypoint_pid') if k in record}
+                fields = {k: record[k] for k in ('exec_root', 'oci_config') if k in record}
                 warm = time.monotonic()
                 memory = Path(saved['directory']) / 'memory-ranges'
                 # Populate shared host cache once; restore itself uses MAP_PRIVATE.
@@ -155,7 +143,7 @@ class ImagePoolBackend(VMBackend):
                     while f.read(1024*1024):
                         pass
                 entry = dict(key=key, fields=fields, directory=saved['directory'],
-                             startup_cache=startup_cache, metadata_cache=metadata_cache,
+                             application_started=False, metadata_cache=metadata_cache,
                              preparation_ms=(warm-started)*1000,
                              warmup_ms=(time.monotonic()-warm)*1000,
                              memory_bytes=memory.stat().st_size,
@@ -228,8 +216,11 @@ class ImagePoolBackend(VMBackend):
                 started = time.perf_counter_ns()
                 result = self.admin('sandbox-snapshot-bind', sandbox_id=sid, template=entry['key'])
                 trace_timing('snapshot_bind', started, sid=sid, details=result)
+                record = self.get(sid)
+                record.update(entry['fields'])
+                self.start_entrypoint(sid, record)
                 with self.lock:
-                    self.get(sid).update(entry['fields'], pool_state='leased', snapshot_template=entry['key'])
+                    self.get(sid).update(pool_state='leased', snapshot_template=entry['key'])
                     self.save_record(sid)
                 return self.response(sid)
             except Exception:
@@ -246,10 +237,6 @@ class ImagePoolBackend(VMBackend):
             if body.get('templateID', inherited) != inherited:
                 raise APIError(400, 'A live-parent fork cannot change its application image')
             return super().create({**body, 'templateID': inherited}, parent)
-        if self.fixed_template:
-            if body.get('templateID', self.fixed_template) != self.fixed_template:
-                raise APIError(400, 'Fixed pool cannot change its application image')
-            return super().create({**body, 'templateID': self.fixed_template})
         self.validate_create(body)
         template = body.get('templateID', self.args.template)
         image = self.image_catalog[template]
@@ -288,18 +275,15 @@ class ImagePoolBackend(VMBackend):
                 trace_timing('image_disk_attach', attached_ns, sid=sid, template=template)
                 mounted_ns = time.perf_counter_ns()
                 helper = os.environ.get('E2B_IMAGE_MOUNT_HELPER')
-                argv = ([helper, 'oci' if 'oci_config' in image else 'legacy'] if helper else
-                        ['/bin/sh', '-c', MOUNT_OCI_IMAGE if 'oci_config' in image else MOUNT_IMAGE])
+                argv = ([helper, 'oci'] if helper else
+                        ['/bin/sh', '-c', MOUNT_OCI_IMAGE])
                 result = vm_rpc.execute(info['live_fork']['vsock_socket'], argv)
                 if result['exit_code']:
                     raise RuntimeError('Application image mount failed: '+result['stderr'].decode(errors='replace'))
                 trace_timing('image_mount', mounted_ns, sid=sid, template=template, guest=result.get('timing'), helper=result.get('stderr', b'').decode(errors='replace'))
-                if 'oci_config' in image:
-                    config = image['oci_config']
-                    result = vm_rpc.execute(info['live_fork']['vsock_socket'], launch_argv(config, start=True))
-                    if result['exit_code']:
-                        raise RuntimeError('OCI entrypoint failed: '+result['stderr'].decode(errors='replace'))
-                    record.update(oci_config=config, entrypoint_pid=int(result['stdout'].strip()))
+                record['oci_config'] = image['oci_config']
+                if not _snapshot_builder:
+                    self.start_entrypoint(sid, record)
                 publish_ns = time.perf_counter_ns()
                 with self.lock:
                     record.update(exec_root='/run/image-root',
@@ -347,19 +331,9 @@ class ImagePoolBackend(VMBackend):
 
     def execute_process(self, sid, process, user=None):
         record = self.get_public(sid)
-        if 'oci_config' not in record:
-            helper = os.environ.get('E2B_IMAGE_MOUNT_HELPER')
-            if helper:
-                envs = process.get('envs', {})
-                argv = [helper, 'exec', record['exec_root'], process.get('cwd') or '/',
-                        str(len(envs)), *[k+'='+v for k, v in envs.items()],
-                        process['cmd'], *process.get('args', [])]
-                return self.raw_execute(sid, argv)
-            from server import vm_process_argv
-            return self.execute(sid, vm_process_argv(process))
-        command = [process['cmd'], *process.get('args', [])]
-        argv = launch_argv(record['oci_config'], command=command, cwd=process.get('cwd'),
-                           user=user, env=process.get('envs'))
+        argv = launch_argv(record['oci_config'],
+                           command=[process['cmd'], *process.get('args', [])],
+                           cwd=process.get('cwd'), user=user, env=process.get('envs'))
         return self.raw_execute(sid, argv)
 
     def execute_process_stream(self, sid, process, user=None):
@@ -369,18 +343,9 @@ class ImagePoolBackend(VMBackend):
             record = self.get_public(sid)
             if record['status'] != 'running':
                 raise APIError(409, 'Sandbox is not running')
-            if 'oci_config' in record:
-                argv = launch_argv(record['oci_config'],
-                    command=[process['cmd'], *process.get('args', [])],
-                    cwd=process.get('cwd'), user=user, env=process.get('envs'))
-            elif os.environ.get('E2B_IMAGE_MOUNT_HELPER'):
-                envs = process.get('envs', {})
-                argv = [os.environ['E2B_IMAGE_MOUNT_HELPER'], 'exec',
-                        record['exec_root'], process.get('cwd') or '/', str(len(envs)),
-                        *[k+'='+v for k,v in envs.items()], process['cmd'], *process.get('args', [])]
-            else:
-                from server import vm_process_argv
-                argv = ['/bin/busybox', 'chroot', record['exec_root'], *vm_process_argv(process)]
+            argv = launch_argv(record['oci_config'],
+                               command=[process['cmd'], *process.get('args', [])],
+                               cwd=process.get('cwd'), user=user, env=process.get('envs'))
             started = time.perf_counter_ns()
             for event in vm_rpc.execute_stream(record['vsock_socket'], argv):
                 if 'exit_code' in event:
@@ -417,8 +382,6 @@ class ImagePoolBackend(VMBackend):
 
     def file_exec(self, sid, args, data=None):
         record = self.get_public(sid)
-        if 'oci_config' not in record:
-            return super().file_exec(sid, args, data)
         helper = '/.__kuasar/busybox'
         if args[:2] == ['/bin/busybox', 'cat']:
             command = [helper, 'od', '-An', '-v', '-tx1', args[2]]
@@ -441,7 +404,7 @@ class ImagePoolBackend(VMBackend):
         images = json.loads(Path(os.environ['E2B_IMAGE_CATALOG']).read_text())
         stats = {}
         for key, image in images.items():
-            if 'oci_config' in image: image['oci_config'] = normalize(image['oci_config'])
+            self.validate_image_config(image)
             path = Path(image['disk']).resolve(strict=True)
             if not path.is_file() or path.stat().st_mode & 0o222:
                 raise APIError(400, 'Image disks must be read-only regular files')
@@ -450,6 +413,12 @@ class ImagePoolBackend(VMBackend):
                     raise APIError(400, 'Image digest mismatch')
             image['disk'] = str(path)
             st = path.stat(); stats[key] = (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
+        with self.lock:
+            candidates = images.keys() - self.image_catalog.keys()
+        if getattr(self, 'slot_disks', None) is not None:
+            # Includes copy/checksum/fsync outside the lifecycle lock. Never
+            # publish an ID that an already-prepared device cannot bind.
+            self.slot_disks.prepare_images([images[key] for key in candidates])
         with self.lock:
             for key in self.image_catalog.keys() & images.keys():
                 if images[key] != self.image_catalog[key] or stats[key] != self.image_stats[key]:

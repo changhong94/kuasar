@@ -12,6 +12,8 @@ from pathlib import Path
 import shutil
 import struct
 import time
+import threading
+import tempfile
 
 FICLONERANGE = 0x4020940D
 CAPACITY = 16 * 1024**3
@@ -29,20 +31,8 @@ class SlotDisks:
         self.cache = self.path/'images'
         self.cache.mkdir(mode=0o700, exist_ok=True)
         self.capacity = max(CAPACITY, *(Path(i["disk"]).stat().st_size for i in catalog.values()))
-        for image in catalog.values():
-            source = Path(image['disk'])
-            if source.stat().st_size % 4096:
-                raise ValueError('Prepared device requires a page-aligned image')
-            target = self.cache/(image['sha256']+'.raw')
-            if not target.exists():
-                temp = target.with_suffix('.tmp')
-                with source.open('rb') as src, temp.open('wb') as dst:
-                    shutil.copyfileobj(src, dst, 1024*1024)
-                    dst.flush(); os.fchmod(dst.fileno(), 0o400); os.fsync(dst.fileno())
-                os.replace(temp, target); sync_dir(self.cache)
-            with target.open('rb') as f:
-                if hashlib.file_digest(f, 'sha256').hexdigest() != image['sha256']:
-                    raise ValueError('Prepared image cache checksum mismatch')
+        self.cache_lock = threading.Lock()
+        self.prepare_images(catalog.values())
         sync_dir(self.path)
         self.preparation_ms = (time.monotonic()-started)*1000
         import json
@@ -50,6 +40,37 @@ class SlotDisks:
             cache_validation_ms=self.preparation_ms, images=len(catalog),
             device_capacity_bytes=self.capacity,
             cached_image_bytes=sum(p.stat().st_size for p in self.cache.glob('*.raw')))))
+
+    def prepare_images(self, images):
+        """Synchronize new immutable images before catalog publication.
+
+        Prepared devices cannot grow after attachment. Reject oversized imports
+        before making their IDs visible; the administrator can prepare a larger
+        pool using an initial catalog containing the larger disk.
+        """
+        with self.cache_lock:
+            for image in images:
+                source = Path(image['disk'])
+                size = source.stat().st_size
+                if size % 4096 or size > self.capacity:
+                    raise ValueError('Image must be page-aligned and fit prepared device capacity')
+                target = self.cache/(image['sha256']+'.raw')
+                if not target.exists():
+                    fd, name = tempfile.mkstemp(prefix='.image-', dir=self.cache)
+                    try:
+                        with os.fdopen(fd, 'w+b') as dst, source.open('rb') as src:
+                            shutil.copyfileobj(src, dst, 1024*1024)
+                            dst.flush(); dst.seek(0)
+                            if hashlib.file_digest(dst, 'sha256').hexdigest() != image['sha256']:
+                                raise ValueError('Prepared image cache checksum mismatch')
+                            os.fchmod(dst.fileno(), 0o400); os.fsync(dst.fileno())
+                        os.replace(name, target); sync_dir(self.cache)
+                    finally:
+                        if os.path.exists(name): os.unlink(name)
+                else:
+                    with target.open('rb') as f:
+                        if hashlib.file_digest(f, 'sha256').hexdigest() != image['sha256']:
+                            raise ValueError('Prepared image cache checksum mismatch')
 
     def create(self, path):
         with open(path, 'xb') as f:

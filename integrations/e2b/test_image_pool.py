@@ -22,7 +22,7 @@ class FakeImages(ImagePoolBackend, FakeBackend):
         for name in ('base','second'):
             p=state.parent/(name+'.disk');p.write_bytes(name.encode());p.chmod(0o444)
             st=p.stat();self.image_stats[name]=(st.st_dev,st.st_ino,st.st_size,st.st_mtime_ns)
-            self.image_catalog[name]=dict(disk=str(p),sha256=hashlib.sha256(name.encode()).hexdigest(),manifest='sha256:'+name)
+            self.image_catalog[name]=dict(disk=str(p),sha256=hashlib.sha256(name.encode()).hexdigest(),manifest='sha256:'+name,oci_config={'Env':[], 'Entrypoint':[], 'Cmd':['/bin/sleep','infinity'], 'WorkingDir':'/', 'User':'0'})
     def admin(self, action, **kw):
         self.calls.append((action,kw))
         return dict(live_fork=dict(api_socket='test-api',vsock_socket='test-vsock'))
@@ -67,6 +67,7 @@ class ImagePoolTests(unittest.TestCase):
         self.backend=FakeImages(Path(self.tmp.name)/'state')
         self.pool=TemplatePool(self.backend,2,refill_delay=0)
         self.backend.template_pool=self.pool
+        for r in self.backend.records.values():r['vsock_socket']='test-vsock'
     def tearDown(self):
         self.pool.close();self.tmp.cleanup()
     def test_one_pool_binds_two_images_only_after_claim(self):
@@ -77,7 +78,7 @@ class ImagePoolTests(unittest.TestCase):
             binding=[sid for sid,r in self.backend.records.items() if r.get('pool_state')=='binding']
             self.assertEqual(len(binding),1)
             with self.assertRaises(APIError):self.backend.get_public(binding[0])
-        with patch('image_pool.add_image_disk',side_effect=attach),patch('image_pool.vm_rpc.execute',return_value={'exit_code':0}):
+        with patch('image_pool.add_image_disk',side_effect=attach),patch('image_pool.vm_rpc.execute',return_value={'exit_code':0,'stdout':b'123'}):
             a=self.backend.create({'templateID':'base'})
             b=self.backend.create({'templateID':'second'})
         self.assertNotEqual(a['sandboxID'],b['sandboxID'])
@@ -94,7 +95,7 @@ class ImagePoolTests(unittest.TestCase):
             self.assertEqual(records[0]['image_disk'], path)
             self.assertEqual(records[0]['template_id'], 'second')
             self.assertNotIn('exec_root', records[0])
-        with patch('image_pool.add_image_disk', side_effect=attach), patch('image_pool.vm_rpc.execute',return_value={'exit_code':0}):
+        with patch('image_pool.add_image_disk', side_effect=attach), patch('image_pool.vm_rpc.execute',return_value={'exit_code':0,'stdout':b'123'}):
             self.backend.create({'templateID':'second'})
 
     def test_binding_commit_failure_never_attaches_image(self):
@@ -140,7 +141,7 @@ class ImagePoolTests(unittest.TestCase):
         with self.assertRaises(APIError):self.backend.create({})
         self.assertEqual(self.pool.status()['ready'],2)
     def test_live_parent_rejects_switching_image(self):
-        with patch('image_pool.add_image_disk'),patch('image_pool.vm_rpc.execute',return_value={'exit_code':0}):
+        with patch('image_pool.add_image_disk'),patch('image_pool.vm_rpc.execute',return_value={'exit_code':0,'stdout':b'123'}):
             parent=self.backend.create({'templateID':'second'})['sandboxID']
         with self.assertRaises(APIError):self.backend.create({'templateID':'base'},parent)
         ready=self.pool.status()['ready']
@@ -150,7 +151,7 @@ class ImagePoolTests(unittest.TestCase):
 
     def test_failed_publish_commit_destroys_bound_slot(self):
         self.backend.fail_assignment = True
-        with patch('image_pool.add_image_disk'),patch('image_pool.vm_rpc.execute',return_value={'exit_code':0}):
+        with patch('image_pool.add_image_disk'),patch('image_pool.vm_rpc.execute',return_value={'exit_code':0,'stdout':b'123'}):
             with self.assertRaises(OSError):self.backend.create({'templateID':'second'})
         self.assertFalse(any(r.get('pool_state')=='leased' for r in self.backend.records.values()))
         self.assertFalse(any(r.get('exec_root') for r in self.backend.committed.values()))
@@ -188,12 +189,51 @@ class ImagePoolTests(unittest.TestCase):
         import json, os, hashlib
         image=self.backend.state.parent/'third.disk';image.write_bytes(b'third');image.chmod(0o444)
         catalog=self.backend.state.parent/'catalog.json'
-        new=dict(disk=str(image),sha256=hashlib.sha256(b'third').hexdigest(),manifest='sha256:third')
+        new=dict(disk=str(image),sha256=hashlib.sha256(b'third').hexdigest(),manifest='sha256:third',oci_config=self.backend.image_catalog['base']['oci_config'])
         catalog.write_text(json.dumps({'third':new}))
         original=set(self.backend.records)
-        with patch.dict(os.environ,{'E2B_IMAGE_CATALOG':str(catalog)}):
+        from unittest.mock import Mock
+        cache = Mock()
+        def prepare(images):
+            if 'third' not in self.backend.image_catalog:
+                self.assertEqual(images, [new])
+        with patch.dict(os.environ,{'E2B_IMAGE_CATALOG':str(catalog)}), \
+             patch.object(self.backend, 'slot_disks', cache, create=True):
+            cache.prepare_images.side_effect = OSError('cache sync failed')
+            with self.assertRaisesRegex(OSError, 'cache sync failed'):
+                self.backend.reload_images()
+            self.assertNotIn('third', self.backend.image_catalog)
+            self.assertEqual(set(self.backend.records), original)
+            cache.prepare_images.side_effect = prepare
             result=self.backend.reload_images()
             self.assertEqual(result['added'],['third']);self.assertEqual(set(self.backend.records),original)
             catalog.write_text(json.dumps({'third':{**new,'manifest':'changed'}}))
             with self.assertRaises(APIError):self.backend.reload_images()
         self.assertEqual(self.backend.image_catalog['third']['manifest'],'sha256:third')
+
+    def test_template_builder_never_starts_entrypoint(self):
+        sid=next(iter(self.backend.records))
+        with patch.object(self.backend,'_create_live',return_value=sid), \
+             patch.object(self.backend,'response',return_value={'sandboxID':sid}), \
+             patch.object(self.backend,'prepare_slot'), \
+             patch('image_pool.add_image_disk'), \
+             patch('image_pool.vm_rpc.execute',return_value={'exit_code':0}) as rpc, \
+             patch.object(self.backend,'start_entrypoint') as start:
+            self.backend._create_image({'templateID':'base'},_snapshot_builder=True)
+        start.assert_not_called()
+        self.assertEqual(rpc.call_count,1)
+        self.assertNotIn('entrypoint_pid',self.backend.records[sid])
+
+    def test_entrypoint_failure_is_never_published(self):
+        before=set(self.backend.records)
+        with patch('image_pool.add_image_disk'), patch('image_pool.vm_rpc.execute',side_effect=[{'exit_code':0},{'exit_code':126,'stderr':b'exec failed'}]):
+            with self.assertRaisesRegex(RuntimeError,'OCI entrypoint failed'):
+                self.backend.create({'templateID':'base'})
+        self.assertTrue(before-set(self.backend.records))
+        self.assertFalse(any(r.get('pool_state')=='leased' for r in self.backend.records.values()))
+
+    def test_missing_oci_and_application_read_hints_rejected(self):
+        with self.assertRaisesRegex(ValueError,'OCI configuration'):
+            self.backend.validate_image_config({})
+        with self.assertRaisesRegex(ValueError,'startup reads'):
+            self.backend.validate_image_config({'startup_read_files':['/usr/local/bin/python3']})

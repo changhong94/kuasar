@@ -63,6 +63,8 @@ name = "stratovirt"
 path = "src/bin/stratovirt/main.rs"
 
 [dev-dependencies]
+tonic = "0.7.2"
+tower = "0.4"
 temp-dir = "0.1.11"
 
 [features]

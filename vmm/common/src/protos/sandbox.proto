@@ -23,6 +23,8 @@ import "google/protobuf/any.proto";
 import "github.com/containerd/containerd/api/services/ttrpc/events/v1/events.proto";
 
 service SandboxService {
+    rpc ForkControl (ForkControlRequest) returns (ForkControlResponse);
+
     // networking
     rpc UpdateInterfaces (UpdateInterfacesRequest) returns (google.protobuf.Empty);
     rpc UpdateRoutes (UpdateRoutesRequest) returns (google.protobuf.Empty);
@@ -61,10 +63,18 @@ message CheckRequest {
 message ExecVMProcessRequest {
     string command = 1;
     bytes stdin = 2;
+    repeated string argv = 3;
+    bool profile = 4;
+    bool structured_output = 5;
 }
 
 message ExecVMProcessResponse {
     string out = 1;
+    string timing_json = 2;
+    string stderr = 3;
+    int32 exit_code = 4;
+    uint32 pid = 5;
+    bool structured_output = 6;
 }
 
 // SyncClockPacket is the data struct for time syncing ttrpc call
@@ -262,3 +272,9 @@ message InjectTaskResponse {
     // Per-target results, in the same order as InjectTaskRequest.tasks.
     repeated ContainerInjectResult results = 1;
 }
+
+// Freeze Task lifecycle RPCs across an in-memory VM fork. Release is idempotent.
+message ForkControlRequest { string token = 1; bool release = 2; string old_mac = 3; repeated Interface interfaces = 4; repeated Route routes = 5; bytes entropy = 6; }
+message ForkProcess { string id = 1; uint32 pid = 2; }
+message ForkContainer { string id = 1; uint32 pid = 2; repeated ForkProcess processes = 3; }
+message ForkControlResponse { repeated ForkContainer containers = 1; bool entropy_applied = 2; }

@@ -79,6 +79,33 @@ impl Handle {
         Ok(())
     }
 
+    pub async fn reset_fork_interface(
+        &mut self,
+        old_mac: &str,
+        intfs: Vec<Interface>,
+    ) -> Result<()> {
+        if intfs.len() != 1 {
+            return Err(other!("fork requires one guest NIC"));
+        }
+        // A lost completion response may be retried after the MAC was updated.
+        let link = match self.find_link(LinkFilter::Address(old_mac)).await {
+            Ok(link) => link,
+            Err(_) => {
+                self.find_link(LinkFilter::Address(&intfs[0].hwAddr))
+                    .await?
+            }
+        };
+        self.enable_link(link.index(), false).await?;
+        self.handle
+            .link()
+            .set(link.index())
+            .address(parse_mac_address(&intfs[0].hwAddr)?.to_vec())
+            .execute()
+            .await
+            .map_err(other_error!(e, "replace fork NIC MAC"))?;
+        self.update_interfaces(intfs).await
+    }
+
     pub async fn update_interfaces(&mut self, intfs: Vec<Interface>) -> Result<()> {
         for intf in intfs {
             // The reliable way to find link is using hardware address

@@ -1,0 +1,213 @@
+{
+  "product": "kuasar-fork",
+  "different": 1,
+  "stages": {
+    "before": {
+      "extent": {
+        "valid": true,
+        "fs_dev": 1795,
+        "unique_extent_bytes": 26457182208,
+        "file_allocated_bytes": 31650127872,
+        "file_count": 267,
+        "extent_count": 1027,
+        "shared_extent_bytes_with_duplicates": 7505649664,
+        "flags": {
+          "8192": 253,
+          "2048": 206,
+          "2049": 24,
+          "1": 207,
+          "0": 303,
+          "8193": 34
+        },
+        "filesystems": {
+          "1795": {
+            "unique_extent_bytes": 26432471040,
+            "file_allocated_bytes": 31625383936,
+            "file_count": 245,
+            "extent_count": 946,
+            "shared_extent_bytes_with_duplicates": 7505649664,
+            "flags": {
+              "8192": 253,
+              "2048": 206,
+              "2049": 24,
+              "1": 185,
+              "0": 244,
+              "8193": 34
+            }
+          },
+          "64770": {
+            "unique_extent_bytes": 24711168,
+            "file_allocated_bytes": 24743936,
+            "file_count": 22,
+            "extent_count": 81,
+            "shared_extent_bytes_with_duplicates": 0,
+            "flags": {
+              "0": 59,
+              "1": 22
+            }
+          }
+        }
+      },
+      "pss_mib": 270.1748046875,
+      "allocated_bytes": 31650189312
+    },
+    "live2": {
+      "extent": {
+        "valid": true,
+        "fs_dev": 1795,
+        "unique_extent_bytes": 26526404608,
+        "file_allocated_bytes": 31719350272,
+        "file_count": 267,
+        "extent_count": 1035,
+        "shared_extent_bytes_with_duplicates": 7505649664,
+        "flags": {
+          "8192": 253,
+          "2048": 208,
+          "2049": 26,
+          "1": 205,
+          "0": 309,
+          "8193": 34
+        },
+        "filesystems": {
+          "1795": {
+            "unique_extent_bytes": 26501677056,
+            "file_allocated_bytes": 31694589952,
+            "file_count": 245,
+            "extent_count": 954,
+            "shared_extent_bytes_with_duplicates": 7505649664,
+            "flags": {
+              "8192": 253,
+              "2048": 208,
+              "2049": 26,
+              "1": 183,
+              "0": 250,
+              "8193": 34
+            }
+          },
+          "64770": {
+            "unique_extent_bytes": 24727552,
+            "file_allocated_bytes": 24760320,
+            "file_count": 22,
+            "extent_count": 81,
+            "shared_extent_bytes_with_duplicates": 0,
+            "flags": {
+              "0": 59,
+              "1": 22
+            }
+          }
+        }
+      },
+      "pss_mib": 497.9921875,
+      "allocated_bytes": 31718354944
+    },
+    "paused2": {
+      "extent": {
+        "valid": true,
+        "fs_dev": 1795,
+        "unique_extent_bytes": 30908542976,
+        "file_allocated_bytes": 36101496832,
+        "file_count": 277,
+        "extent_count": 1103,
+        "shared_extent_bytes_with_duplicates": 7505649664,
+        "flags": {
+          "8192": 253,
+          "2048": 234,
+          "2049": 26,
+          "1": 215,
+          "0": 341,
+          "8193": 34
+        },
+        "filesystems": {
+          "1795": {
+            "unique_extent_bytes": 30883799040,
+            "file_allocated_bytes": 36076720128,
+            "file_count": 255,
+            "extent_count": 1022,
+            "shared_extent_bytes_with_duplicates": 7505649664,
+            "flags": {
+              "8192": 253,
+              "2048": 234,
+              "2049": 26,
+              "1": 193,
+              "0": 282,
+              "8193": 34
+            }
+          },
+          "64770": {
+            "unique_extent_bytes": 24743936,
+            "file_allocated_bytes": 24776704,
+            "file_count": 22,
+            "extent_count": 81,
+            "shared_extent_bytes_with_duplicates": 0,
+            "flags": {
+              "0": 59,
+              "1": 22
+            }
+          }
+        }
+      },
+      "pss_mib": 271.6904296875,
+      "allocated_bytes": 36101558272
+    },
+    "settled": {
+      "extent": {
+        "valid": true,
+        "fs_dev": 1795,
+        "unique_extent_bytes": 26457337856,
+        "file_allocated_bytes": 31650283520,
+        "file_count": 267,
+        "extent_count": 1028,
+        "shared_extent_bytes_with_duplicates": 7505649664,
+        "flags": {
+          "8192": 253,
+          "2048": 206,
+          "2049": 24,
+          "1": 207,
+          "0": 304,
+          "8193": 34
+        },
+        "filesystems": {
+          "1795": {
+            "unique_extent_bytes": 26432475136,
+            "file_allocated_bytes": 31625388032,
+            "file_count": 245,
+            "extent_count": 947,
+            "shared_extent_bytes_with_duplicates": 7505649664,
+            "flags": {
+              "8192": 253,
+              "2048": 206,
+              "2049": 24,
+              "1": 185,
+              "0": 245,
+              "8193": 34
+            }
+          },
+          "64770": {
+            "unique_extent_bytes": 24862720,
+            "file_allocated_bytes": 24895488,
+            "file_count": 22,
+            "extent_count": 81,
+            "shared_extent_bytes_with_duplicates": 0,
+            "flags": {
+              "0": 59,
+              "1": 22
+            }
+          }
+        }
+      },
+      "pss_mib": 270.2734375,
+      "allocated_bytes": 31650344960
+    }
+  },
+  "instances": [
+    "e2b-42a18436b5a7cbd8349bc900",
+    "e2b-9b932de2ea02fdcdfc26709d"
+  ],
+  "digests": [
+    "0d8360056b170b0ad642c40d30d6d5aa5ec795f11e3fb8664861af4f89a5b290",
+    "c4eb78b960f6d8b861d0040d6abf646a1f03922cad44457dd94daa25d13cec01"
+  ],
+  "filesystem_write_backing": "qcow2-ext4",
+  "success": true,
+  "remaining": []
+}

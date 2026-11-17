@@ -1,0 +1,197 @@
+{
+  "rows": [
+    {
+      "round": 1,
+      "api_ms": 48.32382779568434,
+      "python_print_ms": 90.65486793406308,
+      "live": {
+        "VmSize": 2920764,
+        "VmRSS": 113604,
+        "VmData": 2127656,
+        "Threads": 13,
+        "Pss_kib": 108075,
+        "owned_directory_du_bytes": 6852608
+      },
+      "io": [
+        "a5766a5fecafa1a7d75998ff25ef2ea8f41730c9376ddae81d467e70e634465b",
+        322.04930800000045
+      ],
+      "written": {
+        "VmSize": 2920764,
+        "VmRSS": 186924,
+        "VmData": 2127792,
+        "Threads": 13,
+        "Pss_kib": 181395,
+        "owned_directory_du_bytes": 41455616
+      },
+      "pause_ms": 2921.970525989309,
+      "paused": {
+        "VmSize": 823424,
+        "VmRSS": 10312,
+        "VmData": 30728,
+        "Threads": 4,
+        "Pss_kib": 4751,
+        "owned_directory_du_bytes": 2232520704
+      },
+      "resume_api_ms": 32.93904196470976,
+      "resume_print_ms": 71.46370597183704,
+      "delete_ms": 88.18382490426302,
+      "success": true
+    },
+    {
+      "round": 2,
+      "api_ms": 18.331182887777686,
+      "python_print_ms": 60.641241958364844,
+      "live": {
+        "VmSize": 2920764,
+        "VmRSS": 113772,
+        "VmData": 2127656,
+        "Threads": 13,
+        "Pss_kib": 109279,
+        "owned_directory_du_bytes": 6852608
+      },
+      "io": [
+        "a5766a5fecafa1a7d75998ff25ef2ea8f41730c9376ddae81d467e70e634465b",
+        316.1557170000009
+      ],
+      "written": {
+        "VmSize": 2920764,
+        "VmRSS": 187104,
+        "VmData": 2127792,
+        "Threads": 13,
+        "Pss_kib": 182611,
+        "owned_directory_du_bytes": 41455616
+      },
+      "pause_ms": 3473.187376977876,
+      "paused": {
+        "VmSize": 823424,
+        "VmRSS": 10352,
+        "VmData": 30712,
+        "Threads": 4,
+        "Pss_kib": 4790,
+        "owned_directory_du_bytes": 2232520704
+      },
+      "resume_api_ms": 34.07964389771223,
+      "resume_print_ms": 67.76125682517886,
+      "delete_ms": 105.0950929056853,
+      "success": true
+    },
+    {
+      "round": 3,
+      "api_ms": 17.988109029829502,
+      "python_print_ms": 59.35898795723915,
+      "live": {
+        "VmSize": 2920764,
+        "VmRSS": 113712,
+        "VmData": 2127656,
+        "Threads": 13,
+        "Pss_kib": 109217,
+        "owned_directory_du_bytes": 6852608
+      },
+      "io": [
+        "a5766a5fecafa1a7d75998ff25ef2ea8f41730c9376ddae81d467e70e634465b",
+        323.7167320000012
+      ],
+      "written": {
+        "VmSize": 2920764,
+        "VmRSS": 187116,
+        "VmData": 2127792,
+        "Threads": 13,
+        "Pss_kib": 182621,
+        "owned_directory_du_bytes": 41455616
+      },
+      "pause_ms": 2621.326952939853,
+      "paused": {
+        "VmSize": 823424,
+        "VmRSS": 10348,
+        "VmData": 30720,
+        "Threads": 4,
+        "Pss_kib": 4815,
+        "owned_directory_du_bytes": 2232520704
+      },
+      "resume_api_ms": 33.03715703077614,
+      "resume_print_ms": 68.45254707150161,
+      "delete_ms": 100.47305701300502,
+      "success": true
+    },
+    {
+      "round": 4,
+      "api_ms": 18.97843601182103,
+      "python_print_ms": 59.988318011164665,
+      "live": {
+        "VmSize": 2920764,
+        "VmRSS": 113720,
+        "VmData": 2127656,
+        "Threads": 13,
+        "Pss_kib": 109229,
+        "owned_directory_du_bytes": 6852608
+      },
+      "io": [
+        "a5766a5fecafa1a7d75998ff25ef2ea8f41730c9376ddae81d467e70e634465b",
+        730.7438629999989
+      ],
+      "written": {
+        "VmSize": 2920764,
+        "VmRSS": 187120,
+        "VmData": 2127792,
+        "Threads": 13,
+        "Pss_kib": 182629,
+        "owned_directory_du_bytes": 41455616
+      },
+      "pause_ms": 3453.3112708013505,
+      "paused": {
+        "VmSize": 823424,
+        "VmRSS": 10340,
+        "VmData": 30728,
+        "Threads": 4,
+        "Pss_kib": 4771,
+        "owned_directory_du_bytes": 2232520704
+      },
+      "resume_api_ms": 25.507639860734344,
+      "resume_print_ms": 59.661866864189506,
+      "delete_ms": 76.59055199474096,
+      "success": true
+    },
+    {
+      "round": 5,
+      "api_ms": 17.872338881716132,
+      "python_print_ms": 58.70635202154517,
+      "live": {
+        "VmSize": 2920764,
+        "VmRSS": 114916,
+        "VmData": 2127656,
+        "Threads": 13,
+        "Pss_kib": 110415,
+        "owned_directory_du_bytes": 6852608
+      },
+      "io": [
+        "a5766a5fecafa1a7d75998ff25ef2ea8f41730c9376ddae81d467e70e634465b",
+        428.42570999999907
+      ],
+      "written": {
+        "VmSize": 2920764,
+        "VmRSS": 191212,
+        "VmData": 2127792,
+        "Threads": 13,
+        "Pss_kib": 186711,
+        "owned_directory_du_bytes": 41455616
+      },
+      "pause_ms": 2859.116004081443,
+      "paused": {
+        "VmSize": 823424,
+        "VmRSS": 10340,
+        "VmData": 30736,
+        "Threads": 4,
+        "Pss_kib": 4803,
+        "owned_directory_du_bytes": 2232520704
+      },
+      "resume_api_ms": 40.851285215467215,
+      "resume_print_ms": 75.94507420435548,
+      "delete_ms": 86.22284093871713,
+      "success": true
+    }
+  ],
+  "filesystem": "qcow2-ext4",
+  "timing": "client request through response/print; 32 MiB write + fsync",
+  "storage": "du allocated bytes, includes shared/reflink extents; not exclusive physical use"
+}

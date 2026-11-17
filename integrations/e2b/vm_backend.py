@@ -15,7 +15,9 @@ from server import APIError, Backend, trace_timing
 import vm_rpc
 
 
-class VMBackend(Backend):
+from checkpoint_backend import CheckpointBackend
+
+class VMBackend(CheckpointBackend, Backend):
     def __init__(self, args):
         super().__init__(args)
         self.cni = json.loads(Path(args.cni_config).read_text())
@@ -34,6 +36,18 @@ class VMBackend(Backend):
             if record.get('status') == 'deleting':
                 continue  # expiry/reconciliation below retries owned cleanup
             try:
+                if record.get('status') in ('paused', 'pausing', 'resuming'):
+                    checkpoint = self.admin('sandbox-checkpoint-status', sandbox_id=sid)
+                    record['status'] = checkpoint['status']
+                    if record['status'] == 'resuming':
+                        self.admin('sandbox-checkpoint-resume', sandbox_id=sid)
+                        record['status'] = 'running'
+                    if record['status'] == 'failed':
+                        continue
+                    if record['status'] == 'paused':
+                        # Finish RAM release after an adapter interruption during pause.
+                        self.admin('sandbox-checkpoint-pause', sandbox_id=sid)
+                        continue
                 info = self.admin('sandbox-get', sandbox_id=sid)
                 record['status'] = 'running'
                 if info.get('network_ready'):
@@ -88,7 +102,8 @@ class VMBackend(Backend):
             r = self.get(sid)
             response['metadata'] = dict(response['metadata'])
             response['metadata'].update({'kuasar.network.status': r.get('network_state', 'pending'),
-                                         'kuasar.network.ip': r.get('ip', '')})
+                                         'kuasar.network.ip': r.get('ip', ''),
+                                         'kuasar.filesystem.backing': r.get('filesystem_write_backing', 'guest RAM overlay')})
             if r.get('network_error'):
                 response['metadata']['kuasar.network.error'] = r['network_error']
             return response
@@ -225,7 +240,7 @@ class VMBackend(Backend):
                     'expiry': time.time()+timeout, 'metadata': body.get('metadata', {})}
                 self.records[sid].update(getattr(self, 'fixed_image_fields', {}))
                 if parent:
-                    for field in ('template_id', 'exec_root', 'image_manifest', 'image_sha256', 'image_disk', 'oci_config', 'entrypoint_pid', 'slot_disk'):
+                    for field in ('template_id', 'exec_root', 'image_manifest', 'image_sha256', 'image_disk', 'oci_config', 'entrypoint_pid', 'slot_disk', 'filesystem_write_backing', 'filesystem_size_mb'):
                         if field in self.records[parent]:
                             self.records[sid][field] = self.records[parent][field]
                 if _pool_owned:
@@ -346,7 +361,8 @@ class VMBackend(Backend):
         while not self.closed.wait(1):
             with self.lock:
                 expired = [sid for sid, r in self.records.items()
-                           if (r.get('pool_state') not in ('preparing', 'ready')
+                           if (r.get('status') not in ('paused', 'pausing', 'resuming')
+                               and r.get('pool_state') not in ('preparing', 'ready')
                                and r['expiry'] < time.time()) or r.get('status') == 'deleting']
             for sid in expired:
                 try:

@@ -1,0 +1,15 @@
+............................E....................................sssss.........ss.......................
+======================================================================
+ERROR: test_json_types_and_escaped_ids_round_trip (test_durable_state.DurableStateTests.test_json_types_and_escaped_ids_round_trip)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/hong/src/research/python-latest-113/src/kuasar-fork/kuasar-io/kuasar/integrations/e2b/test_durable_state.py", line 111, in test_json_types_and_escaped_ids_round_trip
+    store.save(records)
+  File "/home/hong/src/research/python-latest-113/src/kuasar-fork/kuasar-io/kuasar/integrations/e2b/durable_state.py", line 112, in save
+    self.db.execute("""INSERT INTO state_records(id,value)
+sqlite3.IntegrityError: NOT NULL constraint failed: state_records.value
+
+----------------------------------------------------------------------
+Ran 104 tests in 2.063s
+
+FAILED (errors=1, skipped=7)

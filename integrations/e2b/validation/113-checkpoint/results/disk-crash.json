@@ -1,0 +1,10 @@
+{
+  "success": true,
+  "fsync_survived_owned_vmm_sigkill": true,
+  "parent_continued": true,
+  "independent_writes": true,
+  "fsck_rc": 0,
+  "sha256": "a6448475169ca29f7489b86fc3124dfe1a3d388e76cb0a88f654218544dd9d95",
+  "evidence": "/home/hong/src/research/python-latest-113/data/fork/crash-proof-247008dcd64341d2908a9596b218a596",
+  "owned_remaining": []
+}

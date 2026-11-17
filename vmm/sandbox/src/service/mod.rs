@@ -152,6 +152,8 @@ limitations under the License.
 //! ```
 
 mod snapshot_pool;
+mod checkpoint;
+mod disk_checkpoint;
 
 use std::{
     collections::HashMap, io::ErrorKind, os::unix::fs::PermissionsExt, path::PathBuf, sync::Arc,
@@ -355,6 +357,9 @@ where
 
     let result = match category {
         "sandbox" => match verb {
+            "checkpoint-status" => checkpoint::handle(&handle, &req, "status").await,
+            "checkpoint-pause" => checkpoint::handle(&handle, &req, "pause").await,
+            "checkpoint-resume" => checkpoint::handle(&handle, &req, "resume").await,
             "snapshot-prepare" => snapshot_pool::handle(&handle, &req, "prepare").await,
             "snapshot-capture" => snapshot_pool::handle(&handle, &req, "capture").await,
             "snapshot-bind" => snapshot_pool::handle(&handle, &req, "bind").await,

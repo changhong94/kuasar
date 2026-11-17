@@ -153,14 +153,6 @@ where
     }
     mark("slot_configuration");
     if capture {
-        if current["disks"]
-            .as_array()
-            .is_none_or(|ds| ds.iter().any(|d| d["readonly"] != true))
-        {
-            return Err(anyhow!(
-                "template capture requires exclusively read-only disks"
-            ));
-        }
         tokio::fs::create_dir_all(directory.parent().unwrap()).await?;
         tokio::fs::create_dir(&directory).await?; // Never overwrite a published template.
         let token = uuid::Uuid::new_v4().to_string();
@@ -182,12 +174,14 @@ where
             .await?;
             let mut config: Value =
                 serde_json::from_slice(&tokio::fs::read(directory.join("config.json")).await?)?;
+            super::disk_checkpoint::capture(&mut config, &directory, &directory).await?;
             for (n, disk) in config["disks"]
                 .as_array_mut()
                 .unwrap()
                 .iter_mut()
                 .enumerate()
             {
+                if disk["readonly"] != true { continue; }
                 let target = directory.join(format!("disk-{n}.raw"));
                 // A reflink is independently owned even when the preparation sandbox is destroyed.
                 let status = tokio::process::Command::new("cp")
@@ -291,6 +285,9 @@ where
             {
                 return Err(anyhow!("invalid slot NIC snapshot"));
             }
+            super::disk_checkpoint::stage(&mut config,
+                &Path::new(&sandbox.base_dir).join("fork-disks"),
+                &format!("image-{}", uuid::Uuid::new_v4())).await?;
             mark("stage_parse_patch");
             tokio::fs::write(work.join("state.json"), serde_json::to_vec(&state)?).await?;
             mark("stage_write_state");

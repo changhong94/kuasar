@@ -1,0 +1,170 @@
+{
+  "batch": "113-fork-features-20261117",
+  "samples": 5,
+  "pool_capacity": 2,
+  "filesystem": "qcow2-ext4",
+  "seconds_are_not_normal_fork_latency": true,
+  "metrics": {
+    "api_ms": {
+      "median": 18.331182887777686,
+      "max": 48.32382779568434
+    },
+    "python_print_ms": {
+      "median": 59.988318011164665,
+      "max": 90.65486793406308
+    },
+    "pause_ms": {
+      "median": 2921.970525989309,
+      "max": 3473.187376977876
+    },
+    "resume_api_ms": {
+      "median": 33.03715703077614,
+      "max": 40.851285215467215
+    },
+    "resume_print_ms": {
+      "median": 68.45254707150161,
+      "max": 75.94507420435548
+    },
+    "delete_ms": {
+      "median": 88.18382490426302,
+      "max": 105.0950929056853
+    }
+  },
+  "live": {
+    "VmSize": 2920764,
+    "VmRSS": 113720,
+    "VmData": 2127656,
+    "Threads": 13,
+    "Pss_kib": 109229,
+    "owned_directory_du_bytes": 6852608
+  },
+  "written": {
+    "VmSize": 2920764,
+    "VmRSS": 187116,
+    "VmData": 2127792,
+    "Threads": 13,
+    "Pss_kib": 182621,
+    "owned_directory_du_bytes": 41455616
+  },
+  "paused": {
+    "VmSize": 823424,
+    "VmRSS": 10340,
+    "VmData": 30728,
+    "Threads": 4,
+    "Pss_kib": 4790,
+    "owned_directory_du_bytes": 2232520704
+  },
+  "images": {
+    "base": {
+      "disk": "/home/hong/src/research/python-latest-113/assets/python-base-fork-opt3-v2.erofs",
+      "manifest": "sha256:2fe5997d249a808b8eeea52c58a1dbffbba28754dc11699ef5c029f2d818ce79",
+      "sha256": "0919cac2e2d001b0774bb4bb1acdf191b407a6655fa68377a40e7df5a78f2fa3",
+      "oci_config": {
+        "Env": [
+          "PATH=/usr/local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+          "LANG=C.UTF-8",
+          "GPG_KEY=7169605F62C751356D054A26A821E680E5FA6305",
+          "PYTHON_VERSION=3.12.14",
+          "PYTHON_SHA256=5c8462af5790baf43a321a1559dbe0db06d1be4300fb85fb53c40060668e548a"
+        ],
+        "Cmd": [
+          "/bin/sleep",
+          "infinity"
+        ],
+        "Entrypoint": [],
+        "User": "0",
+        "WorkingDir": "/"
+      },
+      "startup_read_files": []
+    },
+    "node": {
+      "sha256": "8d534ecb2b99e595f521d6e15ac304a230c77a05ade8671d5662ef75606542b4",
+      "manifest": "sha256:47725aca53d3295ec2d3be8f62726599b3033cc262edc2c7e429909b3ac599fc",
+      "disk": "/home/hong/src/research/sixway-languages-20261117/assets/node/root.ext4",
+      "oci_config": {
+        "Env": [
+          "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+          "NODE_VERSION=22.23.5",
+          "YARN_VERSION=1.22.22"
+        ],
+        "Entrypoint": [],
+        "Cmd": [
+          "/bin/sleep",
+          "infinity"
+        ],
+        "User": "0",
+        "WorkingDir": "/"
+      },
+      "startup_read_files": []
+    },
+    "ruby": {
+      "sha256": "12238ce3fba6d5f4692e34367439b54f973e6176854054a450ceb12c3fd8bc5d",
+      "manifest": "sha256:51d211cdbd0b226c7bbae9a377ed5731eaf2acb728000096061c01d360ed213d",
+      "disk": "/home/hong/src/research/sixway-languages-20261117/assets/ruby/root.ext4",
+      "oci_config": {
+        "Env": [
+          "PATH=/usr/local/bundle/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+          "LANG=C.UTF-8",
+          "RUBY_VERSION=3.3.13",
+          "RUBY_DOWNLOAD_URL=https://cache.ruby-lang.org/pub/ruby/3.3/ruby-3.3.13.tar.xz",
+          "RUBY_DOWNLOAD_SHA256=6bd764359992373a96556b45fb7dfe6b6170da34a0a2fd0b7e1be7932fea982b",
+          "GEM_HOME=/usr/local/bundle",
+          "BUNDLE_SILENCE_ROOT_WARNING=1",
+          "BUNDLE_APP_CONFIG=/usr/local/bundle"
+        ],
+        "Cmd": [
+          "/bin/sleep",
+          "infinity"
+        ],
+        "Entrypoint": [],
+        "User": "0",
+        "WorkingDir": "/"
+      },
+      "startup_read_files": []
+    }
+  },
+  "base_commit": "0b646f26dfdb480719374465af3fde10be56c9f9",
+  "branch": "sandbox_fork-features-113",
+  "limitations": [
+    "VMM controller must survive; no host-reboot recovery",
+    "one writable application disk",
+    "E2B direct VM only; not containerd/CRI checkpointing",
+    "new pool capacity 2 batch, not comparable as code-only delta to report A pool 64",
+    "full Python suite has baseline SQLite escaped-field error on SQLite 3.42; targeted 62 tests pass"
+  ],
+  "artifacts": {
+    "deploy/fork/bin/sandboxer": "4353a001bb5d757f4bd65bf4aad1aaa54458d4eb808b2dcd83154712ed5d74fc",
+    "deploy/fork/bin/cloud-hypervisor": "dd766c5bae5bba4eb19603b95a9b76e25a2f32545d936adee2cf1a3182943abf",
+    "deploy/fork/bin/image-mount": "7c8d7f2d99c4875276e6aef903843780af9740d8f76502831b6c5900fcc37ce9"
+  },
+  "paired_storage": {
+    "same": {
+      "live2": {
+        "physical_delta_mib_median": 66.015625,
+        "pss_delta_mib_median": 225.515625
+      },
+      "paused2": {
+        "physical_delta_mib_median": 4245.1484375,
+        "pss_delta_mib_median": 1.5556640625
+      },
+      "settled": {
+        "physical_delta_mib_median": 0.140625,
+        "pss_delta_mib_median": 0.07421875
+      }
+    },
+    "different": {
+      "live2": {
+        "physical_delta_mib_median": 66.015625,
+        "pss_delta_mib_median": 227.71875
+      },
+      "paused2": {
+        "physical_delta_mib_median": 4245.1484375,
+        "pss_delta_mib_median": 1.515625
+      },
+      "settled": {
+        "physical_delta_mib_median": 0.140625,
+        "pss_delta_mib_median": 0.208984375
+      }
+    }
+  }
+}

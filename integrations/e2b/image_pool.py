@@ -147,7 +147,7 @@ class ImagePoolBackend(VMBackend):
                 key = 'image-' + uuid.uuid4().hex
                 saved = self.admin('sandbox-snapshot-capture', sandbox_id=sid, template=key)
                 record = self.get(sid)
-                fields = {k: record[k] for k in ('exec_root', 'oci_config', 'entrypoint_pid') if k in record}
+                fields = {k: record[k] for k in ('exec_root', 'oci_config', 'entrypoint_pid', 'filesystem_write_backing', 'filesystem_size_mb') if k in record}
                 warm = time.monotonic()
                 memory = Path(saved['directory']) / 'memory-ranges'
                 # Populate shared host cache once; restore itself uses MAP_PRIVATE.
@@ -334,6 +334,10 @@ class ImagePoolBackend(VMBackend):
                                     [os.environ['E2B_IMAGE_MOUNT_HELPER'], 'prepare'])
             if result['exit_code']:
                 raise RuntimeError('Generic block device preparation failed')
+            writable_base = os.environ.get('E2B_WRITABLE_BASE')
+            if writable_base:
+                from writable_root import prepare
+                prepare(self, sid, info, writable_base)
             if os.environ.get('E2B_SNAPSHOT_POOL') == '1' and not keep_running:
                 self.admin('sandbox-snapshot-prepare', sandbox_id=sid)
                 for entry in list(self.snapshot_templates.values()):

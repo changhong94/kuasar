@@ -118,7 +118,7 @@ def execute(path, argv, stdin=b'', timeout=60):
 
 def admin(path, action, **kwargs):
     with socket.socket(socket.AF_UNIX) as sock:
-        sock.settimeout(180)
+        sock.settimeout(600 if action.startswith('sandbox-checkpoint-') else 180)
         sock.connect(str(path))
         sock.sendall((json.dumps(dict(action=action, **kwargs))+'\n').encode())
         data = sock.makefile('rb').readline(LIMIT+1)

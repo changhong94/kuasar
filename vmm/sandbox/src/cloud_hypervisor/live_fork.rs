@@ -27,6 +27,13 @@ pub(crate) async fn request(
     endpoint: &str,
     body: Option<Value>,
 ) -> Result<Value> {
+    request_with_timeout(path, method, endpoint, body, Duration::from_secs(3)).await
+}
+
+/// Checkpoint I/O may legitimately exceed the latency-bound live-fork deadline.
+pub(crate) async fn request_with_timeout(
+    path: &str, method: &str, endpoint: &str, body: Option<Value>, timeout: Duration,
+) -> Result<Value> {
     let start = Instant::now();
     let operation = async {
         let mut socket = UnixStream::connect(path).await?;
@@ -36,7 +43,7 @@ pub(crate) async fn request(
             body.len(), body).as_bytes()).await?;
         read_response(&mut socket).await
     };
-    let result = tokio::time::timeout(Duration::from_secs(3), operation)
+    let result = tokio::time::timeout(timeout, operation)
         .await
         .map_err(|_| anyhow!("Cloud Hypervisor {} request timed out", endpoint))?;
     if std::env::var_os("KUASAR_RPC_TIMING").is_some() {

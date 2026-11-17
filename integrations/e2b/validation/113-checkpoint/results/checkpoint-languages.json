@@ -1,0 +1,13 @@
+{
+  "rows": [
+    {
+      "template": "node",
+      "fork_pause_resume_print_file_and_independent_destroy": true
+    },
+    {
+      "template": "ruby",
+      "fork_pause_resume_print_file_and_independent_destroy": true
+    }
+  ],
+  "owned_remaining": []
+}

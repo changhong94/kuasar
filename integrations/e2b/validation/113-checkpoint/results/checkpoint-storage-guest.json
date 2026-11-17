@@ -1,0 +1,91 @@
+{
+  "cycles": [
+    {
+      "id": "e2b-37b1c751e06a56eb506df300",
+      "pause_ms": 2815.397717989981,
+      "before": {
+        "pid": 2110116,
+        "VmSize": 2986304,
+        "VmRSS": 112964,
+        "VmData": 2129136,
+        "Threads": 13
+      },
+      "paused": {
+        "pid": 2110116,
+        "VmSize": 888964,
+        "VmRSS": 11064,
+        "VmData": 31908,
+        "Threads": 4
+      },
+      "checkpoint_bytes": 4295025836,
+      "resume_ms": 36.949648056179285,
+      "fresh_process_answer": "37082c4ebc0ad57df3a03f43acb53caac5ed5e288ce3ea3c:b793f992333c43cebc3217d3bdb4fe52:3:167"
+    },
+    {
+      "id": "e2b-37b1c751e06a56eb506df300",
+      "pause_ms": 4528.219279833138,
+      "before": {
+        "pid": 2110116,
+        "VmSize": 2986304,
+        "VmRSS": 102856,
+        "VmData": 2129136,
+        "Threads": 13
+      },
+      "paused": {
+        "pid": 2110116,
+        "VmSize": 888964,
+        "VmRSS": 11308,
+        "VmData": 31908,
+        "Threads": 4
+      },
+      "checkpoint_bytes": 4295026182,
+      "resume_ms": 35.525851882994175,
+      "fresh_process_answer": "37082c4ebc0ad57df3a03f43acb53caac5ed5e288ce3ea3c:30559883265949ba8fcdde9ac07779bc:4:167"
+    },
+    {
+      "id": "e2b-37b1c751e06a56eb506df300",
+      "pause_ms": 3394.38144210726,
+      "before": {
+        "pid": 2110116,
+        "VmSize": 2986304,
+        "VmRSS": 102788,
+        "VmData": 2129332,
+        "Threads": 13
+      },
+      "paused": {
+        "pid": 2110116,
+        "VmSize": 888964,
+        "VmRSS": 11436,
+        "VmData": 32104,
+        "Threads": 4
+      },
+      "checkpoint_bytes": 4295026215,
+      "resume_ms": 39.65680906549096,
+      "fresh_process_answer": "37082c4ebc0ad57df3a03f43acb53caac5ed5e288ce3ea3c:d3cec64576204c4eafbd4df68b870ce1:5:167"
+    },
+    {
+      "id": "e2b-37b1c751e06a56eb506df300",
+      "pause_ms": 4320.003451080993,
+      "before": {
+        "pid": 2110116,
+        "VmSize": 2986304,
+        "VmRSS": 103812,
+        "VmData": 2129528,
+        "Threads": 13
+      },
+      "paused": {
+        "pid": 2110116,
+        "VmSize": 888964,
+        "VmRSS": 11560,
+        "VmData": 32300,
+        "Threads": 4
+      },
+      "checkpoint_bytes": 4295026185
+    }
+  ],
+  "guest_mountinfo": "60 37 0:47 / / rw,relatime - overlay overlay rw,lowerdir=/run/image-lower,upperdir=/run/image-writes/upper,workdir=/run/image-writes/work,uuid=on,nouserxattr\n61 60 0:25 /usr/bin/busybox /.__kuasar/busybox ro,relatime - overlay overlay rw,lowerdir=/lower,upperdir=/upper/data,workdir=/upper/work,uuid=on,nouserxattr\n62 60 0:5 / /dev rw,nosuid,relatime - devtmpfs dev rw,size=985452k,nr_inodes=246363,mode=755,inode64\n63 60 0:28 / /proc rw,nosuid,nodev,noexec,relatime - proc proc rw\n64 60 0:23 / /sys rw,nosuid,nodev,noexec,relatime - sysfs sysfs rw",
+  "filesystem_backing": "qcow2-ext4",
+  "parent_destroyed_while_child_paused": true,
+  "success": true,
+  "paused_destroy_passed": true
+}

@@ -63,6 +63,45 @@ Run adapter tests with `python3 -m unittest discover -s integrations/e2b -v`.
 The benchmark/fault-injection scripts and full 100-run results are saved under
 `sandbox_bench/results/e2b-deferred-network` alongside the sibling research tree.
 
+## Durable suspension and writable application storage (113 feature branch)
+
+The VM backend supports SDK `pause()`/`beta_pause()` and `connect()` for
+same-identity suspension. Pause joins that sandbox's CNI preparation, takes the
+guest execution barrier, pauses/drains block devices, captures guest RAM/device
+state and the writable disk, and syncs files and directory entries before
+removing the VM's KVM objects and RAM. The VMM API/controller process remains.
+Resume uses private CoW RAM mappings and a new private QCOW write layer, keeps
+the sandbox ID/CID/MAC, reconnects the agent, and releases the saved barrier.
+Paused sandboxes reject commands, report unhealthy to SDK `is_running()`, do
+not expire under the running timeout, and can be explicitly deleted.
+
+This operation intentionally writes a memory snapshot. Normal running-parent
+fork still inherits RAM with CoW and does not write a checkpoint. Snapshot-pool
+creation continues to use its prepared file-backed templates. Do not confuse
+these three paths when measuring startup or storage.
+
+Set `E2B_WRITABLE_BASE` to a sealed, read-only ext4 raw image to enable persistent
+application writes for image-pool sandboxes. Each prepared generic slot owns a
+private QCOW leaf with a reflink of that empty filesystem. The updated
+`image-mount.c` puts overlay upper/work on the same ext4 mount. This requires
+`qemu-img`, a host filesystem supporting reflinks, and the existing writable
+QCOW fork support. Templates remain immutable and image-independent slots are
+not split into per-image VM pools. Metadata `kuasar.filesystem.backing` reports
+`qcow2-ext4`; without this setting the existing guest RAM overlay remains.
+
+Checkpoint export first reflinks the managed disk layers while IO is paused,
+then flattens those independent copies. It does not bypass the VMM's exclusive
+file locks. Publication uses file and directory persistence barriers. One
+writable application disk is supported. Guest RAM may contain dirty filesystem
+pages; restoring the matching RAM and disk checkpoint preserves that state.
+
+Scope: E2B direct-VM guests with no containerd container metadata. This is not
+CRI Pod checkpointing. Adapter recovery can reconcile an interrupted transition
+while the VMM controller survives; host reboot/controller-loss recovery is not
+yet provided. Successful guest fsync and VMM-crash tests do not constitute a
+host power-loss certification. Pausing consumes durable snapshot capacity and
+is not a constant-time operation.
+
 ---
 
 # Explicit Kubernetes backend

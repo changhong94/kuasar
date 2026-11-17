@@ -124,7 +124,15 @@ int main(int argc, char **argv) {
     ready=mono_us();
     if (mount("/dev/vdb","/run/image-lower",filesystem,MS_RDONLY,NULL)) fail("image lower");
     lower=mono_us();
-    if (mount("overlay",root,"overlay",0,"lowerdir=/run/image-lower,upperdir=/run/image-upper,workdir=/run/image-work")) fail("image overlay");
+    /* Durable upper/work must resolve on the same filesystem mount.
+     * The host prepares this image-independent disk before publishing a slot. */
+    const char *options = "lowerdir=/run/image-lower,upperdir=/run/image-upper,workdir=/run/image-work";
+    if (!lstat("/run/image-writes/upper", &st)) {
+        directory("/run/image-writes/upper");
+        directory("/run/image-writes/work");
+        options = "lowerdir=/run/image-lower,upperdir=/run/image-writes/upper,workdir=/run/image-writes/work";
+    } else if (errno != ENOENT) fail("durable upper");
+    if (mount("overlay",root,"overlay",0,options)) fail("image overlay");
     overlay=mono_us();
     /* Compatibility images may lack busybox, but /bin may point to /usr/bin.
      * Resolve its parent and require the target to stay inside the mounted image.

@@ -111,7 +111,7 @@ class Backend:
         return {'sandboxID': sid, 'templateID': r.get('template_id', self.args.template), 'clientID': 'kuasar',
                 'envdVersion': '0.5.7', 'envdAccessToken': r['token'], 'domain': 'localhost',
                 'startedAt': r['startedAt'], 'endAt': datetime.datetime.fromtimestamp(r['expiry'], datetime.timezone.utc).isoformat(),
-                'state': 'running', 'cpuCount': getattr(self.args, 'cpu_count', 2), 'memoryMB': getattr(self.args, 'memory_mb', 512), 'diskSizeMB': 0,
+                'state': r.get('status', 'running'), 'cpuCount': getattr(self.args, 'cpu_count', 2), 'memoryMB': getattr(self.args, 'memory_mb', 512), 'diskSizeMB': r.get('filesystem_size_mb', 0),
                 'metadata': r.get('metadata', {})}
 
     def create(self, body, parent=None):
@@ -277,8 +277,11 @@ class Handler(BaseHTTPRequestHandler):
                 return self.respond(204)
             if len(parts) == 2 and self.command == 'GET':
                 return self.respond(200, backend.response(sid))
+            if len(parts) == 3 and parts[2] == 'pause' and self.command == 'POST' and hasattr(backend, 'pause'):
+                backend.pause(sid)
+                return self.respond(204)
             if len(parts) == 3 and parts[2] == 'connect' and self.command == 'POST':
-                return self.respond(201, backend.response(sid))
+                return self.respond(201, backend.connect(sid, data) if hasattr(backend, 'connect') else backend.response(sid))
             raise APIError(501, 'Unsupported control operation')
         if path == '/images/reload' and self.command == 'POST' and hasattr(backend, 'reload_images'):
             if not hmac.compare_digest(self.headers.get('X-API-Key', ''), backend.key):
@@ -303,6 +306,8 @@ class Handler(BaseHTTPRequestHandler):
             if self.process_user != 'root' and not record.get('oci_config'):
                 raise APIError(403, 'This template supports the root user only')
         if path == '/health':
+            if record.get('status', 'running') != 'running':
+                return self.respond(502, {'status': record['status']})
             return self.respond(200, {'status': 'ok'})
         if path == '/files':
             params = parse_qs(url.query)

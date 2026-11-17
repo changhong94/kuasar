@@ -1,0 +1,15 @@
+E
+======================================================================
+ERROR: test_json_types_and_escaped_ids_round_trip (test_durable_state.DurableStateTests.test_json_types_and_escaped_ids_round_trip)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/hong/src/research/fork-features-113/baseline-tests/test_durable_state.py", line 111, in test_json_types_and_escaped_ids_round_trip
+    store.save(records)
+  File "/home/hong/src/research/fork-features-113/baseline-tests/durable_state.py", line 112, in save
+    self.db.execute("""INSERT INTO state_records(id,value)
+sqlite3.IntegrityError: NOT NULL constraint failed: state_records.value
+
+----------------------------------------------------------------------
+Ran 1 test in 0.002s
+
+FAILED (errors=1)

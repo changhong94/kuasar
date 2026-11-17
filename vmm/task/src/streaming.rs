@@ -25,7 +25,7 @@ use async_trait::async_trait;
 use containerd_shim::protos::protobuf::{CodedInputStream, Message};
 use futures::{ready, Future};
 use lazy_static::lazy_static;
-use log::{debug, info, warn};
+use log::{debug, warn};
 use protobuf::MessageFull;
 use tokio::{
     io::{AsyncRead, AsyncWrite},
@@ -100,9 +100,33 @@ impl PreemptableReceiver {
             res = self.receiver.recv() => {
                 Ok(res)
             }
-            _ = self.preempt.recv() => {
+            Some(()) = self.preempt.recv() => {
                 Err(ttrpc::Error::Others("channel is preempted".to_string()))
             }
+        }
+    }
+}
+
+// A transport reset cancels the RPC future, not the container's output.
+// Return the receiver and any unsent packet so a later connection can resume.
+struct OutputLease {
+    service: Service,
+    id: String,
+    receiver: Option<PreemptableReceiver>,
+    remaining: Option<Any>,
+}
+
+impl Drop for OutputLease {
+    fn drop(&mut self) {
+        if let Some(receiver) = self.receiver.take() {
+            let service = self.service.clone();
+            let id = self.id.clone();
+            let remaining = self.remaining.take();
+            tokio::spawn(async move {
+                service
+                    .return_preempted_receiver(&id, receiver, remaining)
+                    .await;
+            });
         }
     }
 }
@@ -330,55 +354,33 @@ impl Service {
         stream_id: &String,
         stream: ServerStream<Any, Any>,
     ) -> ttrpc::Result<()> {
-        let mut receiver = self.preempt_receiver(stream_id).await?;
-        if let Some(a) = self.get_remaining_data(stream_id).await {
-            if let Err(e) = stream.send(&a).await {
-                debug!("failed to send data of stream {}, {}", stream_id, e);
-                self.return_preempted_receiver(stream_id, receiver, Some(a))
-                    .await;
-                return Err(e);
-            }
-        }
+        let receiver = self.preempt_receiver(stream_id).await?;
+        let mut lease = OutputLease {
+            service: self.clone(),
+            id: stream_id.clone(),
+            receiver: Some(receiver),
+            remaining: None,
+        };
+        lease.remaining = self.get_remaining_data(stream_id).await;
         loop {
-            let r = if let Ok(res) = receiver.recv().await {
-                res
-            } else {
-                self.return_preempted_receiver(stream_id, receiver, None)
-                    .await;
-                info!("stream {} is preempted", stream_id);
-                return Err(ttrpc::Error::Others("channel is preempted".to_string()));
-            };
-            match r {
-                Some(d) => {
-                    if d.is_empty() {
-                        return Ok(());
-                    }
+            if let Some(a) = lease.remaining.as_ref() {
+                stream.send(a).await?;
+                lease.remaining = None;
+            }
+            match lease.receiver.as_mut().unwrap().recv().await? {
+                Some(d) if !d.is_empty() => {
                     let mut data = Data::new();
                     data.data = d;
-                    let data_bytes = match data.write_to_bytes() {
-                        Ok(b) => b,
-                        Err(e) => {
-                            debug!("failed to marshal data of stream {}, {}", stream_id, e);
-                            self.return_preempted_receiver(stream_id, receiver, None)
-                                .await;
-                            return Err(ttrpc::Error::Others(format!(
-                                "failed to write data {}",
-                                e
-                            )));
-                        }
-                    };
-                    let a = new_any!(Data, data_bytes);
-                    match stream.send(&a).await {
-                        Ok(_) => {}
-                        Err(e) => {
-                            debug!("failed to send data of stream {}, {}", stream_id, e);
-                            self.return_preempted_receiver(stream_id, receiver, Some(a))
-                                .await;
-                            return Err(e);
-                        }
-                    };
+                    let bytes = data
+                        .write_to_bytes()
+                        .map_err(ttrpc::err_to_others!(e, "failed to marshal output"))?;
+                    // Store before awaiting send: cancellation must not discard
+                    // a packet already removed from the container's pipe.
+                    lease.remaining = Some(new_any!(Data, bytes));
                 }
-                None => {
+                _ => {
+                    self.remove_io_channel(stream_id).await;
+                    lease.receiver.take();
                     return Ok(());
                 }
             }
@@ -511,6 +513,60 @@ mod tests {
     use tokio::io::AsyncReadExt;
 
     use super::*;
+
+    #[tokio::test]
+    async fn cancelled_output_returns_receiver_and_unsent_packet() {
+        let service = Service {
+            ios: Arc::new(Mutex::new(HashMap::new())),
+        };
+        let id = "cancel-stdout".to_string();
+        let sender = service.get_or_insert_sender(&id).await.unwrap();
+        let receiver = service.preempt_receiver(&id).await.unwrap();
+        sender.send(vec![4, 5, 6]).await.unwrap();
+        let mut packet = Any::new();
+        packet.value = vec![1, 2, 3];
+        let lease = OutputLease {
+            service: service.clone(),
+            id: id.clone(),
+            receiver: Some(receiver),
+            remaining: Some(packet),
+        };
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _lease = lease;
+            tx.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        rx.await.unwrap();
+        task.abort();
+        let _ = task.await;
+        let mut receiver = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            service.preempt_receiver(&id),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            service.get_remaining_data(&id).await.unwrap().value,
+            vec![1, 2, 3]
+        );
+        assert_eq!(receiver.recv().await.unwrap(), Some(vec![4, 5, 6]));
+    }
+
+    #[tokio::test]
+    async fn closed_preemption_channel_does_not_discard_queued_output() {
+        for _ in 0..100 {
+            let (sender, receiver) = channel(2);
+            let (preempt, preempt_rx) = channel(1);
+            sender.send(vec![1, 2, 3]).await.unwrap();
+            drop(sender);
+            drop(preempt);
+            let mut output = PreemptableReceiver::new(receiver, preempt_rx);
+            assert_eq!(output.recv().await.unwrap(), Some(vec![1, 2, 3]));
+            assert_eq!(output.recv().await.unwrap(), None);
+        }
+    }
 
     #[tokio::test]
     async fn test_streaming_stdin() {

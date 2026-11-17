@@ -845,6 +845,7 @@ mod tests {
             exit_signal: Default::default(),
             sandbox_cgroups: Default::default(),
             storage_policy: ContainerStoragePolicy::default(),
+            prepared_fork: None,
             restore: RestoreMetadata {
                 orphan_container_ids,
                 ..Default::default()

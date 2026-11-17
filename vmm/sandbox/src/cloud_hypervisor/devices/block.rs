@@ -20,6 +20,8 @@ use serde_derive::Serialize;
 #[derive(CmdLineParams, Debug, Clone)]
 pub struct Disk {
     path: String,
+    #[property(key = "image_type")]
+    image_type: Option<String>,
     id: String,
     readonly: Option<bool>,
     direct: Option<bool>,
@@ -35,9 +37,15 @@ pub struct Disk {
 impl_device_no_bus!(Disk);
 
 impl Disk {
+    pub fn raw(mut self) -> Self {
+        self.image_type = Some("raw".to_string());
+        self
+    }
+
     pub fn new(id: &str, path: &str, readonly: bool, direct: bool) -> Self {
         Self {
             path: path.to_string(),
+            image_type: None,
             id: id.to_string(),
             readonly: Some(readonly),
             direct: Some(direct),

@@ -65,6 +65,47 @@ pub(crate) async fn new_sandbox_client(address: &str) -> Result<SandboxServiceCl
     Ok(SandboxServiceClient::new(client))
 }
 
+/// A connection accepted during a vsock reset can immediately become unusable.
+/// Retry the complete connect/check operation, never keep probing a dead client.
+/// The overall deadline remains the existing agent check deadline.
+pub(crate) async fn reconnect_checked_sandbox_client(
+    address: &str,
+) -> Result<SandboxServiceClient> {
+    let mut last_error = String::new();
+    let attempt = async {
+        loop {
+            let result = async {
+                let client = new_sandbox_client(address).await?;
+                client
+                    .check(with_timeout(1_000_000_000), &CheckRequest::new())
+                    .await
+                    .map_err(|e| anyhow!("agent check: {}", e))?;
+                Ok::<_, Error>(client)
+            }
+            .await;
+            match result {
+                Ok(client) => return client,
+                Err(error) => {
+                    tracing::warn!(%address, %error, "reconnecting failed fork agent transport");
+                    last_error = error.to_string();
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    };
+    timeout(Duration::from_secs(DEFAULT_CLIENT_CHECK_TIMEOUT), attempt)
+        .await
+        .map_err(|_| {
+            anyhow!(
+                "{}s timeout reconnecting agent {}: {}",
+                DEFAULT_CLIENT_CHECK_TIMEOUT,
+                address,
+                last_error
+            )
+            .into()
+        })
+}
+
 pub(crate) async fn new_sandbox_client_fail_fast(address: &str) -> Result<SandboxServiceClient> {
     let client =
         new_ttrpc_client_with_fast_fail(address, FAST_FAIL_CONNECT_TIMEOUT_IN_SECS).await?;
@@ -400,7 +441,9 @@ fn checked_compute_delta(c_send: i64, c_arrive: i64, s_send: i64, s_arrive: i64)
 }
 
 pub(crate) async fn publish_event(envelope: Envelope) -> Result<()> {
-    let publisher = RemotePublisher::new("/run/containerd/containerd.sock.ttrpc")
+    let address = std::env::var("KUASAR_CONTAINERD_TTRPC_ADDRESS")
+        .unwrap_or_else(|_| "/run/containerd/containerd.sock.ttrpc".into());
+    let publisher = RemotePublisher::new(&address)
         .await
         .map_err(|e| anyhow!("publisher connects to containerd: {}", e))?;
 
@@ -431,6 +474,62 @@ mod tests {
         checked_compute_delta, is_fatal_error, new_ttrpc_client_with_fast_fail,
         new_ttrpc_client_with_timeout,
     };
+
+    #[tokio::test]
+    async fn fork_reconnect_replaces_a_reset_connection() {
+        use std::{sync::Arc, time::Duration};
+
+        use vmm_common::api::{
+            empty::Empty,
+            sandbox::CheckRequest,
+            sandbox_ttrpc::{create_sandbox_service, SandboxService},
+        };
+        struct Healthy;
+        #[async_trait::async_trait]
+        impl SandboxService for Healthy {
+            async fn check(
+                &self,
+                _: &ttrpc::r#async::TtrpcContext,
+                _: CheckRequest,
+            ) -> ttrpc::Result<Empty> {
+                Ok(Empty::new())
+            }
+        }
+        let path = format!("/tmp/kuasar-reconnect-{}.sock", uuid::Uuid::new_v4());
+        let address = format!("unix://{}", path);
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let serve_address = address.clone();
+        let reset = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            drop(stream);
+            drop(listener);
+            std::fs::remove_file(path).unwrap();
+            let mut server = ttrpc::r#async::Server::new()
+                .bind(&serve_address)
+                .unwrap()
+                .register_service(create_sandbox_service(Arc::new(Box::new(Healthy))));
+            server.start().await.unwrap();
+            server
+        });
+        let client = tokio::time::timeout(
+            Duration::from_secs(3),
+            super::reconnect_checked_sandbox_client(&address),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        client
+            .check(
+                ttrpc::context::with_timeout(1_000_000_000),
+                &CheckRequest::new(),
+            )
+            .await
+            .unwrap();
+        drop(client);
+        let mut server = reset.await.unwrap();
+        server.shutdown().await.unwrap();
+        let _ = std::fs::remove_file(address.strip_prefix("unix://").unwrap());
+    }
 
     #[tokio::test]
     async fn test_new_ttrpc_client_timeout() {

@@ -100,6 +100,14 @@ impl Default for VirtioBlkConfig {
 
 #[derive(Clone, Deserialize)]
 pub struct CloudHypervisorVMConfig {
+    /// Experimental private-RAM same-host fork profile (read-only disk by default).
+    #[serde(default)]
+    pub live_fork: bool,
+    #[serde(default)]
+    pub live_fork_agent: bool,
+    /// Consume a dedicated raw seed disk; subsequent forks use private qcow2 leaves.
+    #[serde(default)]
+    pub live_fork_writable_disk: bool,
     pub path: String,
     #[serde(flatten)]
     pub common: HypervisorCommonConfig,
@@ -117,6 +125,9 @@ pub struct CloudHypervisorVMConfig {
 impl Default for CloudHypervisorVMConfig {
     fn default() -> Self {
         Self {
+            live_fork: false,
+            live_fork_agent: false,
+            live_fork_writable_disk: false,
             path: "/usr/local/bin/cloud-hypervisor".to_string(),
             common: HypervisorCommonConfig::default(),
             hugepages: false,

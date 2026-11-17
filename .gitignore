@@ -5,3 +5,7 @@ target
 **/src/api/*
 !**/src/api/mod.rs
 vmm/common/Cargo.lock
+
+# Generated Python bytecode from research tools.
+__pycache__/
+*.pyc

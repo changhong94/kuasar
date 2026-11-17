@@ -48,6 +48,26 @@ limitations under the License.
 //!
 //! Response: `{"ok":true,"sandbox_id":"<id>","template_id":"<id>"}`
 //!
+//! ### sandbox-fork with deferred networking
+//! `defer_network: true` requires a one-NIC source and an empty, separate child
+//! `netns`. The child restores that NIC onto an isolated TAP and returns
+//! `network_ready: false`; vsock execution does not wait for CNI. The caller may
+//! run CNI ADD concurrently with execution, then call `sandbox-network-complete`
+//! with `sandbox_id`. Completion adopts CNI eth0 addresses, resets inherited TCP
+//! connections/guest identity, persists metadata, and connects the TAP last.
+//! `sandbox-get` exposes network readiness. Failed completion can be retried;
+//! successful completion is idempotent. A pending child cannot yet be a source.
+//! The caller owns CNI ADD/DEL and must join/cancel its provisioning work before
+//! removing the namespace. Destroying a pending sandbox invalidates completion.
+//! This path does not accept a `prepared_token` and does not pre-create a child VM.
+//!
+//! ### sandbox-fork-prepare — reserve an empty slot and blocked network
+//! Supply `sandbox_id` and `netns`; no VM is started and no parent state is saved.
+//! Pass the returned `prepared_token`, same ID and namespace to `sandbox-fork`.
+//! Tokens are single-use and expire on stop or sandboxer restart. Destroy unused
+//! slots with `sandbox-destroy`; the caller remains responsible for CNI cleanup.
+//! Preparation cost must be reported separately from warm activation latency.
+//!
 //! ### sandbox-destroy — stop a sandbox and release all resources
 //! ```json
 //! {"action":"sandbox-destroy","sandbox_id":"<id>"}
@@ -143,7 +163,7 @@ use containerd_sandbox::{
 use log::{error, info, warn};
 use serde_json::{json, Value};
 use tokio::{
-    fs::{create_dir_all, remove_dir_all},
+    fs::remove_dir_all,
     io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader},
     net::{UnixListener, UnixStream},
     sync::{Mutex, RwLock},
@@ -185,6 +205,7 @@ where
     /// Root directory for sandbox slots created by the `run` action.
     /// Set to `<sandboxer --dir>/`.
     pub sandbox_base_dir: PathBuf,
+    pub live_fork_lock: Arc<Mutex<()>>,
 }
 
 /// Listens on a Unix socket and dispatches sandbox and template management commands.
@@ -332,10 +353,15 @@ where
 
     let result = match category {
         "sandbox" => match verb {
+            "boot" => handle_live_boot(&handle, &req).await,
+            "fork" => handle_live_fork(&handle, &req).await,
+            "fork-prepare" => handle_prepare_fork(&handle, &req).await,
+            "network-complete" => handle_complete_network(&handle, &req).await,
             "run" => handle_sandbox_run(&handle, &req).await,
             "destroy" => handle_sandbox_destroy(&handle, &req).await,
             "list" => handle_sandbox_list(&handle).await,
             "get" => handle_sandbox_get(&handle, &req).await,
+            "bind-containerd" | "export-containerd" => handle_containerd_bind(&handle, &req).await,
             _ => Err(anyhow!("unknown sandbox action: sandbox-{}", verb)),
         },
         "template" => match verb {
@@ -552,6 +578,7 @@ where
     F: VMFactory + Sync + Send + 'static,
     F::VM: VM + Snapshottable + Sync + Send + 'static,
 {
+    let transaction = handle.live_fork_lock.lock().await;
     let sandbox_id = req["sandbox_id"]
         .as_str()
         .ok_or_else(|| anyhow!("missing sandbox_id"))?
@@ -561,7 +588,7 @@ where
         let sandboxes = handle.sandboxes.read().await;
         resolve_sandbox_id(&sandboxes, &sandbox_id)?
     };
-    destroy_sandbox(handle, &full_id).await?;
+    destroy_sandbox_inner(handle, &full_id, Some(transaction)).await?;
     Ok(json!({"ok": true, "sandbox_id": full_id}))
 }
 
@@ -578,6 +605,8 @@ where
             "id": id,
             "status": sandbox_status_str(&sb.status),
             "base_dir": sb.base_dir,
+        "live_fork": sb.vm.live_fork_info(),
+        "network_ready": sb.network.as_ref().map_or(true, |n| n.deferred_old_mac.is_none()),
             "template_id": sb.restore.template_id,
             "template_snapshot_type": sb.restore.template_snapshot_type.as_ref().map(snapshot_type_str),
         }));
@@ -605,11 +634,98 @@ where
         "id": sb.id,
         "status": sandbox_status_str(&sb.status),
         "base_dir": sb.base_dir,
+        "live_fork": sb.vm.live_fork_info(),
+        "network_ready": sb.network.as_ref().map_or(true, |n| n.deferred_old_mac.is_none()),
         "template_id": sb.restore.template_id,
         "template_snapshot_type": sb.restore.template_snapshot_type.as_ref().map(snapshot_type_str),
         "lease_mode": sb.restore.lease_mode.as_ref().map(|m| format!("{}", m)),
         "memory_restore_mode": sb.restore.memory_restore_mode.as_ref().map(|m| format!("{:?}", m)),
     }))
+}
+
+async fn handle_containerd_bind<F>(handle: &Handle<F>, req: &Value) -> anyhow::Result<Value>
+where
+    F: VMFactory + Sync + Send + 'static,
+    F::VM: VM + Snapshottable + Sync + Send + 'static,
+{
+    let _transaction = handle.live_fork_lock.lock().await;
+    let id = req["sandbox_id"]
+        .as_str()
+        .ok_or_else(|| anyhow!("missing sandbox_id"))?;
+    validate_id(id)?;
+    let namespace = req["namespace"]
+        .as_str()
+        .ok_or_else(|| anyhow!("missing namespace"))?;
+    validate_key(namespace)?;
+    let sb = handle
+        .sandboxes
+        .read()
+        .await
+        .get(id)
+        .cloned()
+        .ok_or_else(|| anyhow!("sandbox not found"))?;
+    let mut sb = sb.lock().await;
+    if !sb.vm.live_fork_agent() || !matches!(sb.status, SandboxStatus::Running(_)) {
+        return Err(anyhow!(
+            "containerd adoption requires a running live-fork agent sandbox"
+        ));
+    }
+    if let Some(owner) = sb.data.labels.get("io.kuasar.containerd.namespace") {
+        if owner != namespace {
+            return Err(anyhow!("sandbox already bound to namespace {}", owner));
+        }
+    }
+    if req["action"].as_str() == Some("sandbox-bind-containerd") {
+        if let Some(ids) = req.get("container_ids") {
+            let ids: std::collections::HashMap<String, String> =
+                serde_json::from_value(ids.clone())?;
+            let mut external = std::collections::HashSet::new();
+            for (guest, host) in &ids {
+                if !sb.containers.contains_key(guest)
+                    || host.is_empty()
+                    || !host
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b))
+                    || !external.insert(host)
+                {
+                    return Err(anyhow!("invalid inherited container ID mapping"));
+                }
+            }
+            crate::utils::write_file_atomic(
+                format!("{}/containerd-ids.json", sb.base_dir),
+                &serde_json::to_string(&ids)?,
+            )
+            .await?;
+        }
+        if let Some(uid) = req["pod_uid"].as_str() {
+            sb.data
+                .labels
+                .insert("io.kubernetes.pod.uid".into(), uid.into());
+            let config = sb.data.config.get_or_insert_with(Default::default);
+            let metadata = config.metadata.get_or_insert_with(Default::default);
+            metadata.uid = uid.into();
+            if let Some(name) = req["pod_name"].as_str() {
+                metadata.name = name.into();
+            }
+            if let Some(namespace) = req["pod_namespace"].as_str() {
+                metadata.namespace = namespace.into();
+            }
+        }
+
+        sb.data
+            .labels
+            .insert("io.kuasar.containerd.namespace".into(), namespace.into());
+        sb.data
+            .labels
+            .insert("io.kuasar.fork.event-namespace".into(), namespace.into());
+        crate::utils::write_file_atomic(format!("{}/containerd-namespace", sb.base_dir), namespace)
+            .await?;
+        sb.dump().await?;
+    }
+    let tasks = sb.data.task_resources().map_err(|e| anyhow!("{}", e))?;
+    Ok(
+        json!({"ok":true,"id":id,"namespace":namespace,"task_address":sb.data.task_address,"tasks":tasks}),
+    )
 }
 
 fn sandbox_status_str(status: &containerd_sandbox::SandboxStatus) -> &'static str {
@@ -1289,59 +1405,518 @@ where
 ///
 /// Used by the `run` action to enable e2e testing of the restore path without a running
 /// containerd/Kubernetes stack.
+/// Cold-boot a VM-only fork seed through the same registered sandbox lifecycle.
+async fn handle_live_boot<F>(handle: &Handle<F>, req: &Value) -> anyhow::Result<Value>
+where
+    F: VMFactory + Sync + Send + 'static,
+    F::VM: VM + Snapshottable + Sync + Send + 'static,
+{
+    let _transaction = handle.live_fork_lock.lock().await;
+    let id = req["sandbox_id"]
+        .as_str()
+        .ok_or_else(|| anyhow!("missing sandbox_id"))?;
+    validate_id(id)?;
+    create_sandbox_slot_in_netns(handle, id, req["netns"].as_str().unwrap_or("")).await?;
+    let slot = handle
+        .sandboxes
+        .read()
+        .await
+        .get(id)
+        .cloned()
+        .ok_or_else(|| anyhow!("sandbox removed during creation"))?;
+    let result = async {
+        let mut sandbox = slot.lock().await;
+        if !sandbox.vm.live_fork_profile() {
+            return Err(anyhow!("sandbox-boot requires hypervisor.live_fork=true"));
+        }
+        if !matches!(sandbox.status, SandboxStatus::Created) {
+            return Err(anyhow!("sandbox is no longer unstarted"));
+        }
+        if !sandbox.data.netns.is_empty() {
+            sandbox.prepare_network().await?;
+        }
+        sandbox.start().await?;
+        if sandbox.vm.live_fork_agent() {
+            sandbox.data.task_address = format!("ttrpc+{}", sandbox.vm.socket_address());
+        }
+        sandbox.dump().await?;
+        Ok(json!({"ok": true, "id": id, "live_fork": sandbox.vm.live_fork_info()}))
+    }
+    .await;
+    match result {
+        Ok(response) => {
+            monitor(slot);
+            Ok(response)
+        }
+        Err(error) => {
+            destroy_sandbox(handle, id).await?;
+            Err(error)
+        }
+    }
+}
+
+/// Prepare only generic host/network resources; no VM or parent RAM exists yet.
+/// The caller owns the CNI namespace and must destroy an unused reservation.
+async fn handle_complete_network<F>(handle: &Handle<F>, req: &Value) -> anyhow::Result<Value>
+where
+    F: VMFactory + Sync + Send + 'static,
+    F::VM: VM + Snapshottable + Sync + Send + 'static,
+{
+    let id = req["sandbox_id"]
+        .as_str()
+        .ok_or_else(|| anyhow!("missing sandbox_id"))?;
+    validate_id(id)?;
+    let sandbox = handle
+        .sandboxes
+        .read()
+        .await
+        .get(id)
+        .cloned()
+        .ok_or_else(|| anyhow!("sandbox not found"))?;
+    let mut sandbox = sandbox.lock().await;
+    if !matches!(sandbox.status, SandboxStatus::Running(_)) {
+        return Err(anyhow!("network completion requires a running sandbox"));
+    }
+    sandbox.finish_deferred_network().await?;
+    Ok(json!({"ok": true, "id": id, "network_ready": true}))
+}
+
+async fn handle_prepare_fork<F>(handle: &Handle<F>, req: &Value) -> anyhow::Result<Value>
+where
+    F: VMFactory + Sync + Send + 'static,
+    F::VM: VM + Snapshottable + Sync + Send + 'static,
+{
+    let _transaction = handle.live_fork_lock.lock().await;
+    let id = req["sandbox_id"]
+        .as_str()
+        .ok_or_else(|| anyhow!("missing sandbox_id"))?;
+    validate_id(id)?;
+    let netns = req["netns"].as_str().unwrap_or("");
+    let namespace = if netns.is_empty() {
+        None
+    } else {
+        Some(std::fs::File::open(netns)?)
+    };
+    create_sandbox_slot_in_netns(handle, id, netns).await?;
+    let child = handle
+        .sandboxes
+        .read()
+        .await
+        .get(id)
+        .cloned()
+        .ok_or_else(|| anyhow!("sandbox removed during preparation"))?;
+    let result = async {
+        let mut child = child.lock().await;
+        if !matches!(child.status, SandboxStatus::Created) || !child.vm.live_fork_profile() {
+            return Err(anyhow!("slot must be a new live_fork sandbox"));
+        }
+        let token = uuid::Uuid::new_v4().to_string();
+        child.prepared_fork = Some(crate::sandbox::PreparedFork {
+            token: token.clone(),
+            namespace,
+        });
+        if !netns.is_empty() {
+            child.prepare_network().await?;
+            child
+                .network
+                .as_ref()
+                .ok_or_else(|| anyhow!("missing prepared network"))?
+                .fork_block(true)
+                .await?;
+        }
+        child.dump().await?;
+        Ok(json!({"ok": true, "id": id, "prepared_token": token}))
+    }
+    .await;
+    if result.is_err() {
+        destroy_sandbox(handle, id).await?;
+    }
+    result
+}
+
+fn validate_prepared_fork<V: VM>(
+    child: &KuasarSandbox<V>,
+    token: &str,
+    netns: &str,
+) -> anyhow::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let reservation = child
+        .prepared_fork
+        .as_ref()
+        .ok_or_else(|| anyhow!("no active fork reservation"))?;
+    if reservation.token != token
+        || child.data.netns != netns
+        || !matches!(child.status, SandboxStatus::Created)
+    {
+        return Err(anyhow!(
+            "fork reservation does not match token, namespace or state"
+        ));
+    }
+    if let Some(namespace) = &reservation.namespace {
+        let held = namespace.metadata()?;
+        let current = std::fs::metadata(netns)?;
+        if held.dev() != current.dev() || held.ino() != current.ino() || child.network.is_none() {
+            return Err(anyhow!("prepared namespace changed"));
+        }
+    }
+    Ok(())
+}
+
+async fn handle_live_fork<F>(handle: &Handle<F>, req: &Value) -> anyhow::Result<Value>
+where
+    F: VMFactory + Sync + Send + 'static,
+    F::VM: VM + Snapshottable + Sync + Send + 'static,
+{
+    let request_started = std::time::Instant::now();
+    let _transaction = handle.live_fork_lock.lock().await;
+    let source = req["source_id"]
+        .as_str()
+        .ok_or_else(|| anyhow!("missing source_id"))?;
+    let id = req["sandbox_id"]
+        .as_str()
+        .ok_or_else(|| anyhow!("missing sandbox_id"))?;
+    let mark = |phase: &str| {
+        if std::env::var_os("KUASAR_RPC_TIMING").is_some() {
+            tracing::info!(
+                id,
+                source,
+                phase,
+                elapsed_ms = request_started.elapsed().as_secs_f64() * 1000.0,
+                "fork timing: sandbox phase"
+            );
+        }
+    };
+    mark("transaction_acquired");
+    validate_id(source)?;
+    validate_id(id)?;
+    if source == id {
+        return Err(anyhow!("source and child IDs must differ"));
+    }
+    let parent = handle
+        .sandboxes
+        .read()
+        .await
+        .get(source)
+        .cloned()
+        .ok_or_else(|| anyhow!("source sandbox not found"))?;
+    // Reserve child before taking VM locks; status queries hold the map read
+    // lock while accessing VMs, so taking the write lock afterwards deadlocks.
+    let netns = req["netns"].as_str().unwrap_or("");
+    let prepared_token = match req.get("prepared_token") {
+        Some(value) => Some(
+            value
+                .as_str()
+                .ok_or_else(|| anyhow!("invalid prepared_token"))?,
+        ),
+        None => None,
+    };
+    if prepared_token.is_none() {
+        create_sandbox_slot_in_netns(handle, id, netns).await?;
+    }
+    let child = handle
+        .sandboxes
+        .read()
+        .await
+        .get(id)
+        .cloned()
+        .ok_or_else(|| anyhow!("sandbox removed during creation"))?;
+    // Reject invalid or reused tokens without destroying an unrelated sandbox.
+    if let Some(token) = prepared_token {
+        validate_prepared_fork(&*child.lock().await, token, netns)?;
+    }
+    let result = async {
+        let mut parent = parent.lock().await;
+        let mut child = child.lock().await;
+        if !matches!(child.status, SandboxStatus::Created)
+            || !matches!(parent.status, SandboxStatus::Running(_))
+            || !parent.vm.live_fork_profile()
+        {
+            return Err(anyhow!("source must be a running live_fork sandbox"));
+        }
+        // Revalidate under the VM locks: a concurrent stop invalidates the slot.
+        if let Some(token) = prepared_token {
+            validate_prepared_fork(&child, token, netns)?;
+            child.prepared_fork.take();
+        }
+        child.inherit_fork_metadata(&parent).await?;
+        let deferred = req["defer_network"].as_bool().unwrap_or(false);
+        if parent
+            .network
+            .as_ref()
+            .is_some_and(|n| n.deferred_old_mac.is_some())
+        {
+            return Err(anyhow!("source network is not yet ready"));
+        }
+        if deferred {
+            if prepared_token.is_some()
+                || std::env::var_os("KUASAR_FORK_SERIAL_COMPLETION").is_some()
+            {
+                return Err(anyhow!(
+                    "deferred network requires the ordinary optimized fork path"
+                ));
+            }
+            let network = parent
+                .network
+                .as_ref()
+                .ok_or_else(|| anyhow!("deferred network requires a networked source"))?;
+            crate::network::Network::deferred(&mut child, network).await?;
+        } else if prepared_token.is_none() && !child.data.netns.is_empty() {
+            child.prepare_network().await?;
+        }
+        if parent.network.is_some() != child.network.is_some() {
+            return Err(anyhow!("fork requires matching NIC topology"));
+        }
+        if let Some(network) = child.network.as_ref().filter(|_| !deferred) {
+            if prepared_token.is_none() {
+                network.fork_block(true).await?;
+            }
+            network
+                .reject_parent_identity(parent.network.as_ref().unwrap())
+                .await?;
+        }
+
+        mark("network_prepared");
+        let token = uuid::Uuid::new_v4().to_string();
+        if parent.vm.live_fork_agent() {
+            let prepared = parent
+                .fork_agent_control(&token, false)
+                .await
+                .and_then(|inventory| parent.validate_fork_inventory(&inventory));
+            if let Err(error) = prepared {
+                parent.fork_agent_control(&token, true).await?;
+                return Err(anyhow!("prepare live containers: {}", error));
+            }
+        }
+        mark("agent_frozen");
+        let pid = match child.vm.fork_from(&mut parent.vm).await {
+            Ok(pid) => pid,
+            Err(error) => {
+                // CH restores the parent on child startup failure. If a later
+                // adoption step failed, ensure the reconstructed source resumes.
+                let _ = parent.vm.resume_fork().await;
+                if parent.vm.live_fork_agent() {
+                    parent.reconnect_fork_agent().await?;
+                    parent.fork_agent_control(&token, true).await?;
+                }
+                return Err(anyhow!("fork source {}: {}", source, error));
+            }
+        };
+        mark("vm_restored");
+        let serial = std::env::var_os("KUASAR_FORK_SERIAL_COMPLETION").is_some();
+        if !serial && child.vm.live_fork_agent() {
+            // The socket identity is already final. Include it in the required
+            // metadata-before-resume write instead of writing it a second time.
+            child.data.task_address = format!("ttrpc+{}", child.vm.socket_address());
+        }
+        child.status = SandboxStatus::Running(pid);
+        let finalize = async {
+            if !child.sandbox_cgroups.cgroup_parent_path.is_empty() {
+                child.add_to_cgroup().await?;
+            }
+            // Preserve metadata-before-resume ordering, but independent branches
+            // need not serialize filesystem IO or HTTP round trips. Await BOTH
+            // results even on error; dropping an in-flight mutation is ambiguous.
+            let started = std::time::Instant::now();
+            let (child_dump, parent_dump) = tokio::join!(child.dump(), parent.dump());
+            child_dump?;
+            parent_dump?;
+            if std::env::var_os("KUASAR_RPC_TIMING").is_some() {
+                tracing::info!(
+                    id,
+                    milliseconds = started.elapsed().as_secs_f64() * 1000.0,
+                    "fork timing: metadata before resume"
+                );
+            }
+            let started = std::time::Instant::now();
+            let (parent_resume, child_resume) =
+                tokio::join!(parent.vm.resume_fork(), child.vm.resume_fork());
+            parent_resume?;
+            child_resume?;
+            if std::env::var_os("KUASAR_RPC_TIMING").is_some() {
+                tracing::info!(
+                    id,
+                    milliseconds = started.elapsed().as_secs_f64() * 1000.0,
+                    "fork timing: both resume requests"
+                );
+            }
+            // Guests are running, but do not expose the fork or immutable disk
+            // hashes until both branches know the old owner's barriers finished.
+            // Transport checks do not release the frozen guest. Overlap them
+            // with disk retirement, but await every branch (also on error) and
+            // publish neither client until BOTH durability barriers succeeded.
+            let disk_gate = async {
+                let started = std::time::Instant::now();
+                let results = tokio::join!(
+                    parent.vm.finish_fork_disks(), child.vm.finish_fork_disks()
+                );
+                if std::env::var_os("KUASAR_RPC_TIMING").is_some() {
+                    tracing::info!(id, milliseconds = started.elapsed().as_secs_f64() * 1000.0,
+                        "fork timing: disk durability gate");
+                }
+                results
+            };
+            let connect = async {
+                if !parent.vm.live_fork_agent() {
+                    return None;
+                }
+                let started = std::time::Instant::now();
+                let results = tokio::join!(parent.prepare_fork_agent(), child.prepare_fork_agent());
+                if std::env::var_os("KUASAR_RPC_TIMING").is_some() {
+                    tracing::info!(id, milliseconds = started.elapsed().as_secs_f64() * 1000.0,
+                        "fork timing: both agent reconnects");
+                }
+                Some(results)
+            };
+            let ((parent_close, child_close), connections) = tokio::join!(disk_gate, connect);
+            parent_close?;
+            child_close?;
+            if let Some((parent_connection, child_connection)) = connections {
+                let parent_connection = parent_connection?;
+                let child_connection = child_connection?;
+                tokio::join!(parent.install_fork_agent(parent_connection),
+                             child.install_fork_agent(child_connection));
+                if serial {
+                    parent.fork_agent_control(&token, true).await?;
+                    child
+                        .fork_agent_release_network(&token, parent.network.as_ref(), None)
+                        .await?;
+                } else {
+                    let parent_seed: [u8; 32] = rand::random();
+                    let child_seed: [u8; 32] = rand::random();
+                    // Independent guest transactions. Await both results even
+                    // on error; cancellation must not lose a release outcome.
+                    let (parent_done, child_done) = tokio::join!(
+                        parent.fork_agent_release_network(&token, None, Some(&parent_seed)),
+                        child.fork_agent_release_network(
+                            &token,
+                            if deferred {
+                                None
+                            } else {
+                                parent.network.as_ref()
+                            },
+                            Some(&child_seed)
+                        ),
+                    );
+                    parent_done?;
+                    child_done?;
+                }
+                if let Some(network) = child.network.as_ref().filter(|_| !deferred) {
+                    network.fork_block(false).await?;
+                }
+                mark("agents_released");
+                if serial {
+                    child.data.task_address = format!("ttrpc+{}", child.vm.socket_address());
+                    parent.reseed_guest_entropy().await;
+                    child.reseed_guest_entropy().await;
+                    child.dump().await?;
+                }
+                mark("identity_persisted");
+            }
+            Ok::<(), containerd_sandbox::error::Error>(())
+        }
+        .await;
+        if let Err(error) = finalize {
+            let _ = parent.vm.resume_fork().await;
+            if parent.vm.live_fork_agent() {
+                parent.reconnect_fork_agent().await?;
+                parent.fork_agent_control(&token, true).await?;
+            }
+            return Err(anyhow!("finalize fork: {}", error));
+        }
+        mark("complete");
+        Ok(json!({"ok": true, "id": id, "source_id": source,
+            "network_ready": !deferred, "live_fork": child.vm.live_fork_info()}))
+    }
+    .await;
+    match result {
+        Ok(response) => {
+            monitor(child);
+            Ok(response)
+        }
+        Err(error) => {
+            // Preserve reconciliation information if CH is still processing a
+            // request whose HTTP response was lost. Cleanup must not orphan it.
+            child.lock().await.dump().await?;
+            destroy_sandbox(handle, id).await?;
+            Err(error)
+        }
+    }
+}
+
 async fn create_sandbox_slot<F>(handle: &Handle<F>, sandbox_id: &str) -> Result<()>
 where
     F: VMFactory + Sync + Send + 'static,
     F::VM: VM + Snapshottable + Sync + Send + 'static,
 {
-    if handle.sandboxes.read().await.contains_key(sandbox_id) {
+    create_sandbox_slot_in_netns(handle, sandbox_id, "").await
+}
+
+async fn create_sandbox_slot_in_netns<F>(
+    handle: &Handle<F>,
+    sandbox_id: &str,
+    netns: &str,
+) -> Result<()>
+where
+    F: VMFactory + Sync + Send + 'static,
+    F::VM: VM + Snapshottable + Sync + Send + 'static,
+{
+    let mut sandboxes = handle.sandboxes.write().await;
+    if sandboxes.contains_key(sandbox_id) {
         return Err(anyhow!("sandbox {} already exists", sandbox_id).into());
     }
     let base_dir = handle.sandbox_base_dir.join(sandbox_id);
-    create_dir_all(&base_dir)
+    tokio::fs::create_dir(&base_dir)
         .await
         .map_err(|e| anyhow!("create sandbox dir {:?}: {}", base_dir, e))?;
-    let base_dir_str = base_dir.to_string_lossy().to_string();
-    let sandbox_opt = SandboxOption {
-        base_dir: base_dir_str.clone(),
-        sandbox: SandboxData {
+    let result = async {
+        let base_dir_str = base_dir.to_string_lossy().to_string();
+        let sandbox_opt = SandboxOption {
+            base_dir: base_dir_str.clone(),
+            sandbox: SandboxData {
+                config: Some(Default::default()),
+                id: sandbox_id.to_string(),
+                netns: netns.to_string(),
+                ..Default::default()
+            },
+        };
+        let vm = handle
+            .factory
+            .create_vm(sandbox_id, &sandbox_opt)
+            .await
+            .map_err(|e| anyhow!("create_vm for sandbox slot {}: {}", sandbox_id, e))?;
+        let sandbox = KuasarSandbox {
+            vm,
             id: sandbox_id.to_string(),
-            ..Default::default()
-        },
-    };
-    let vm = handle
-        .factory
-        .create_vm(sandbox_id, &sandbox_opt)
-        .await
-        .map_err(|e| anyhow!("create_vm for sandbox slot {}: {}", sandbox_id, e))?;
-    let sandbox = KuasarSandbox {
-        vm,
-        id: sandbox_id.to_string(),
-        status: SandboxStatus::Created,
-        base_dir: base_dir_str,
-        data: SandboxData {
-            id: sandbox_id.to_string(),
-            ..Default::default()
-        },
-        containers: Default::default(),
-        storages: DeviceGraph::default(),
-        id_generator: 0,
-        network: None,
-        client: Arc::new(Mutex::new(None)),
-        exit_signal: Arc::new(ExitSignal::default()),
-        sandbox_cgroups: SandboxCgroup::default(),
-        storage_policy: handle.factory.storage_policy(),
-        restore: RestoreMetadata::default(),
-    };
-    sandbox.setup_sandbox_files().await?;
-    sandbox.dump().await?;
-    handle
-        .sandboxes
-        .write()
-        .await
-        .insert(sandbox_id.to_string(), Arc::new(Mutex::new(sandbox)));
-    info!("service:created sandbox slot {} for run", sandbox_id);
-    Ok(())
+            status: SandboxStatus::Created,
+            base_dir: base_dir_str,
+            data: SandboxData {
+                config: Some(Default::default()),
+                id: sandbox_id.to_string(),
+                netns: netns.to_string(),
+                ..Default::default()
+            },
+            containers: Default::default(),
+            storages: DeviceGraph::default(),
+            id_generator: 0,
+            network: None,
+            client: Arc::new(Mutex::new(None)),
+            exit_signal: Arc::new(ExitSignal::default()),
+            sandbox_cgroups: SandboxCgroup::default(),
+            storage_policy: handle.factory.storage_policy(),
+            restore: RestoreMetadata::default(),
+            prepared_fork: None,
+        };
+        sandbox.setup_sandbox_files().await?;
+        sandbox.dump().await?;
+        sandboxes.insert(sandbox_id.to_string(), Arc::new(Mutex::new(sandbox)));
+        info!("service:created sandbox slot {} for run", sandbox_id);
+        Ok(())
+    }
+    .await;
+    if result.is_err() {
+        remove_dir_all(&base_dir).await?;
+    }
+    result
 }
 
 /// Stop a running sandbox, release its template lease, and delete its directory.
@@ -1349,6 +1924,18 @@ where
 /// Mirrors the `KuasarSandboxer::delete` path but runs entirely through the admin socket,
 /// so it works for sandboxes created by the `run` action without containerd involvement.
 async fn destroy_sandbox<F>(handle: &Handle<F>, sandbox_id: &str) -> Result<()>
+where
+    F: VMFactory + Sync + Send + 'static,
+    F::VM: VM + Snapshottable + Sync + Send + 'static,
+{
+    destroy_sandbox_inner(handle, sandbox_id, None).await
+}
+
+async fn destroy_sandbox_inner<F>(
+    handle: &Handle<F>,
+    sandbox_id: &str,
+    mut transaction: Option<tokio::sync::MutexGuard<'_, ()>>,
+) -> Result<()>
 where
     F: VMFactory + Sync + Send + 'static,
     F::VM: VM + Snapshottable + Sync + Send + 'static,
@@ -1376,9 +1963,16 @@ where
         memory_restore_mode = sandbox.restore.memory_restore_mode.clone();
 
         sandbox
-            .stop(true)
+            .stop_vm(true)
             .await
             .map_err(|e| anyhow!("stop sandbox {}: {}", sandbox_id, e))?;
+
+        // The VMM is confirmed stopped and the status forbids another fork.
+        // Keep this sandbox locked and registered until cleanup finishes, so its
+        // ID cannot be reused. Unrelated forks need not wait for tc/unmount IO.
+        // Error cleanup called from an outer fork retains that caller's gate.
+        drop(transaction.take());
+        sandbox.destroy_network().await;
 
         // Admin-created sandboxes have an empty cgroup_parent_path; skip cgroup removal.
         if !sandbox.sandbox_cgroups.cgroup_parent_path.is_empty()

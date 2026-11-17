@@ -44,3 +44,42 @@ pub const IPC_NAMESPACE: &str = "ipc";
 pub const PID_NAMESPACE: &str = "pid";
 pub const UTS_NAMESPACE: &str = "uts";
 pub const CGROUP_NAMESPACE: &str = "cgroup";
+
+/// Streaming requests already carry their endpoints. Legacy FIFO/serial IO still
+/// needs the host-generated descriptor file to translate paths into devices.
+pub fn self_describing_stream_io(paths: &[&str]) -> bool {
+    paths.iter().any(|p| !p.is_empty())
+        && paths.iter().all(|p| {
+            p.is_empty()
+                || p.strip_prefix("ttrpc+hvsock://")
+                    .and_then(|p| p.split_once('?'))
+                    .is_some_and(|(address, query)| {
+                        !address.is_empty()
+                            && query.split('&').any(|item| {
+                                item.strip_prefix("streaming_id=")
+                                    .is_some_and(|id| !id.is_empty())
+                            })
+                    })
+        })
+}
+
+#[cfg(test)]
+mod streaming_io_tests {
+    use super::self_describing_stream_io;
+    #[test]
+    fn only_explicit_stream_endpoints_bypass_descriptor_files() {
+        let stream = "ttrpc+hvsock:///run/task.vsock:1025?streaming_id=output";
+        assert!(self_describing_stream_io(&["", stream, stream]));
+        for legacy in [
+            "",
+            "/run/fifo",
+            "/dev/ttyS1",
+            "vsock://2:1025",
+            "ttrpc+hvsock://?streaming_id=x",
+            "ttrpc+hvsock://sock?streaming_id=",
+        ] {
+            assert!(!self_describing_stream_io(&[legacy]));
+        }
+        assert!(!self_describing_stream_io(&[stream, "/run/fifo"]));
+    }
+}

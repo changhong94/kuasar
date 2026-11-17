@@ -279,10 +279,10 @@ where
                 }
             }
         };
-        copy(src, dst, exit_signal, on_close).await;
-        if to.contains(STREAMING) {
-            remove_channel(&to).await.unwrap_or_default();
-        }
+        copy(src, dst, exit_signal, on_close, true).await;
+        // The streaming consumer removes the channel after draining EOF.
+        // Removing it here closes the preemption channel before queued output
+        // has necessarily reached the host.
         debug!("finished copy io from container to {}", to);
     });
     Ok(())
@@ -333,7 +333,7 @@ where
                 }
             }
         };
-        copy(src, dst, exit_signal, on_close).await;
+        copy(src, dst, exit_signal, on_close, false).await;
         if from.contains(STREAMING) {
             remove_channel(&from).await.unwrap_or_default();
         }
@@ -342,20 +342,35 @@ where
     Ok(())
 }
 
-async fn copy<R, W, F>(mut src: R, mut dst: W, exit_signal: Arc<ExitSignal>, on_close: Option<F>)
-where
+async fn copy<R, W, F>(
+    mut src: R,
+    mut dst: W,
+    exit_signal: Arc<ExitSignal>,
+    on_close: Option<F>,
+    drain_output: bool,
+) where
     R: AsyncRead + Send + Unpin + 'static,
     W: AsyncWrite + Send + Unpin + 'static,
     F: FnOnce() + Send + 'static,
 {
+    // Keep the same future alive when exit wins the race: recreating io_copy
+    // would discard a buffer already read from the process pipe.
+    let transfer = io_copy(&mut src, &mut dst);
+    tokio::pin!(transfer);
     tokio::select! {
         _ = exit_signal.wait() => {
-            debug!("container exit, copy task should exit too");
-        },
-        res = io_copy(&mut src, &mut dst) => {
-           if let Err(e) = res {
-                error!("copy io failed {}", e);
+            if drain_output {
+                // The process has closed its pipe, but its final bytes still need
+                // forwarding. Bound drainage in case a descendant holds it open.
+                match tokio::time::timeout(std::time::Duration::from_secs(2), &mut transfer).await {
+                    Ok(Err(e)) => error!("drain output failed {}", e),
+                    Err(_) => debug!("output drain timed out after process exit"),
+                    _ => {},
+                }
             }
+        },
+        res = &mut transfer => {
+            if let Err(e) = res { error!("copy io failed {}", e); }
         }
     }
     if let Some(f) = on_close {
@@ -587,5 +602,26 @@ impl VsockIo {
             vio.stream = Some(stream);
         }
         Ok(vio)
+    }
+}
+
+#[cfg(test)]
+mod fork_io_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn exited_process_still_drains_buffered_stdout() {
+        let (mut producer, source) = tokio::io::duplex(8192);
+        let (destination, mut consumer) = tokio::io::duplex(64);
+        let bytes = vec![0x5a; 8192];
+        producer.write_all(&bytes).await.unwrap();
+        drop(producer);
+        let exit = Arc::new(ExitSignal::default());
+        exit.signal();
+        let transfer = tokio::spawn(copy(source, destination, exit, None::<fn()>, true));
+        let mut received = Vec::new();
+        consumer.read_to_end(&mut received).await.unwrap();
+        transfer.await.unwrap();
+        assert_eq!(received, bytes);
     }
 }

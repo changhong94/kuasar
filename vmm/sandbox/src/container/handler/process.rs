@@ -77,13 +77,19 @@ where
                 terminal: io.terminal,
             });
             new_proc.io_devices = io_devices;
-            let io_str = serde_json::to_string(&new_proc.data.io)
-                .map_err(|e| anyhow!("failed to parse io in container, {}", e))?;
-            let io_file_path = format!(
-                "{}/{}-{}-{}",
-                bundle, IO_FILE_PREFIX, self.container_id, self.proc.id
-            );
-            write_file_atomic(io_file_path, &io_str).await?;
+            // Explicit streaming endpoints are also present in ExecProcessRequest.
+            // Only legacy FIFO/serial paths require a shared descriptor file.
+            let direct_stream = sandbox.vm.live_fork_agent()
+                && vmm_common::self_describing_stream_io(&[&io.stdin, &io.stdout, &io.stderr]);
+            if !direct_stream {
+                let io_str = serde_json::to_string(&new_proc.data.io)
+                    .map_err(|e| anyhow!("failed to parse io in container, {}", e))?;
+                let io_file_path = format!(
+                    "{}/{}-{}-{}",
+                    bundle, IO_FILE_PREFIX, self.container_id, self.proc.id
+                );
+                write_file_atomic(io_file_path, &io_str).await?;
+            }
         }
         let container = sandbox.container_mut(&self.container_id)?;
         container.processes.push(new_proc);

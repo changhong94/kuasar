@@ -16,7 +16,7 @@ limitations under the License.
 
 use std::{
     io::{Read, Result, Write},
-    mem::{forget, MaybeUninit},
+    mem::MaybeUninit,
     os::{
         fd::OwnedFd,
         unix::io::{AsRawFd, IntoRawFd, RawFd},
@@ -28,7 +28,7 @@ use std::{
 use futures::ready;
 use nix::{
     errno::Errno,
-    unistd::{close, read, write},
+    unistd::{read, write},
 };
 use tokio::io::{unix::AsyncFd, AsyncRead, AsyncWrite, ReadBuf};
 
@@ -47,18 +47,6 @@ impl Write for &DirectFd {
 
     fn flush(&mut self) -> Result<()> {
         Ok(())
-    }
-}
-
-impl DirectFd {
-    fn close(&mut self) -> Result<()> {
-        close(self.0.as_raw_fd()).map_err(Errno::into)
-    }
-}
-
-impl Drop for DirectFd {
-    fn drop(&mut self) {
-        let _ = self.close();
     }
 }
 
@@ -87,9 +75,7 @@ impl AsRawFd for RawStream {
 
 impl IntoRawFd for RawStream {
     fn into_raw_fd(self) -> RawFd {
-        let fd = self.as_raw_fd();
-        forget(self);
-        fd
+        self.0.into_inner().0.into_raw_fd()
     }
 }
 
@@ -142,5 +128,20 @@ impl AsyncWrite for RawStream {
 
     fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<()>> {
         Poll::Ready(Ok(()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[tokio::test]
+    async fn stream_owns_one_fd_and_transfers_it_without_leaking_registration() {
+        let (a, _b) = std::os::unix::net::UnixStream::pair().unwrap();
+        drop(RawStream::new(a.into()).unwrap());
+        let (a, _b) = std::os::unix::net::UnixStream::pair().unwrap();
+        let raw = RawStream::new(a.into()).unwrap().into_raw_fd();
+        // SAFETY: into_raw_fd transferred sole ownership to this test.
+        let owned = unsafe { <OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(raw) };
+        drop(owned);
     }
 }

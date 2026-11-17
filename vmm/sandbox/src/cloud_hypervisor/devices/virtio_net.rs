@@ -35,7 +35,7 @@ pub struct VirtioNetDevice {
 
     pub(crate) mac: String,
 
-    #[property(key = "num_queues", predicate = "self.fds.len()>0")]
+    #[property(key = "num_queues", predicate = "self.num_queues>0")]
     pub(crate) num_queues: u32,
 }
 

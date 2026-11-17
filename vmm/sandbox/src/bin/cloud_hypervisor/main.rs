@@ -69,6 +69,15 @@ async fn main() {
         );
         std::process::exit(1);
     }
+    if config.hypervisor.live_fork
+        && (config.template_pool.is_some()
+            || config.sandbox.snapshot.enable_environment_restore
+            || config.sandbox.snapshot.enable_warmfork_restore
+            || config.sandbox.snapshot.enable_continuation_restore)
+    {
+        log::error!("live_fork cannot be combined with snapshot/restore pools");
+        std::process::exit(1);
+    }
     vmm_sandboxer::utils::start_watchdog();
     if let Err(e) = sd_notify::notify(&[sd_notify::NotifyState::Ready]) {
         log::error!("failed to send ready notify: {}", e);

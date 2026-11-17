@@ -154,11 +154,35 @@ where
     Ok(Vec::new())
 }
 
+#[derive(Default, Debug, serde::Serialize)]
+pub struct ProcessTiming {
+    pub pid: u32,
+    pub subscribe_us: u128,
+    pub spawn_us: u128,
+    pub first_stdout_us: u128,
+    pub stdout_eof_us: u128,
+    pub exit_us: u128,
+    pub total_us: u128,
+}
+
 pub async fn spawn_and_wait(
-    mut cmd: std::process::Command,
+    cmd: std::process::Command,
     stdin: &[u8],
 ) -> Result<(String, String, i32)> {
+    spawn_and_wait_profile(cmd, stdin, None).await
+}
+
+pub async fn spawn_and_wait_profile(
+    mut cmd: std::process::Command,
+    stdin: &[u8],
+    mut timing: Option<&mut ProcessTiming>,
+) -> Result<(String, String, i32)> {
+    let started = std::time::Instant::now();
     let mut monitor = PidMonitorGuard::subscribe().await?;
+    if let Some(t) = timing.as_deref_mut() {
+        t.subscribe_us = started.elapsed().as_micros();
+    }
+    let spawn_started = std::time::Instant::now();
     let child = match cmd.spawn() {
         Ok(child) => child,
         Err(e) => {
@@ -170,7 +194,13 @@ pub async fn spawn_and_wait(
         }
     };
 
+    if let Some(t) = timing.as_deref_mut() {
+        t.spawn_us = spawn_started.elapsed().as_micros();
+    }
     let pid = child.id();
+    if let Some(t) = timing.as_deref_mut() {
+        t.pid = pid;
+    }
     let mut child = Some(child);
 
     let mut process_exited = false;
@@ -228,11 +258,43 @@ pub async fn spawn_and_wait(
         #[cfg(test)]
         spawn_test_reaper(&mut child, pid);
 
-        let (stdout_bytes, stderr_bytes, exit_code) = tokio::join!(
-            read_std_bytes(stdout_stream),
-            read_std_bytes(stderr_stream),
-            monitor.wait(pid as i32)
-        );
+        let profile = timing.is_some();
+        let stdout = async {
+            if !profile {
+                return (read_std_bytes(stdout_stream).await, 0, 0);
+            }
+            let mut out = Vec::new();
+            let mut first = 0;
+            if let Some(mut stream) = stdout_stream {
+                let mut buf = [0u8; 4096];
+                loop {
+                    let n = match stream.read(&mut buf).await {
+                        Ok(n) => n,
+                        Err(e) => return (Err(e), first, started.elapsed().as_micros()),
+                    };
+                    if n == 0 {
+                        break;
+                    }
+                    if first == 0 {
+                        first = started.elapsed().as_micros();
+                    }
+                    out.extend_from_slice(&buf[..n]);
+                }
+            }
+            (Ok(out), first, started.elapsed().as_micros())
+        };
+        let exit = async {
+            let code = monitor.wait(pid as i32).await;
+            (code, started.elapsed().as_micros())
+        };
+        let ((stdout_bytes, first, eof), stderr_bytes, (exit_code, exit_time)) =
+            tokio::join!(stdout, read_std_bytes(stderr_stream), exit);
+        if let Some(t) = timing.as_deref_mut() {
+            t.first_stdout_us = first;
+            t.stdout_eof_us = eof;
+            t.exit_us = exit_time;
+            t.total_us = started.elapsed().as_micros();
+        }
 
         process_exited = true;
 

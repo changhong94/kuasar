@@ -32,9 +32,15 @@ impl Hooks<CloudHypervisorVM> for CloudHypervisorHooks {
     }
 
     async fn post_start(&self, sandbox: &mut KuasarSandbox<CloudHypervisorVM>) -> Result<()> {
+        if sandbox.vm.live_fork && sandbox.vm.fork_cid.is_none() {
+            sandbox.data.task_address.clear();
+            return Ok(());
+        }
         sandbox.data.task_address = format!("ttrpc+{}", sandbox.vm.agent_socket);
         // sync clock
-        sandbox.sync_clock().await;
+        if !sandbox.vm.live_fork {
+            sandbox.sync_clock().await;
+        }
         Ok(())
     }
 }

@@ -73,6 +73,7 @@ pub mod config;
 pub mod devices;
 pub mod factory;
 pub mod hooks;
+mod live_fork;
 mod memory_backend;
 pub mod snapshot;
 
@@ -93,6 +94,26 @@ struct NetHotplugInfo {
 
 #[derive(Default, Serialize, Deserialize)]
 pub struct CloudHypervisorVM {
+    #[serde(default)]
+    live_fork: bool,
+    #[serde(default)]
+    fork_writable_seed: Option<String>,
+    #[serde(default)]
+    fork_net: Option<serde_json::Value>,
+    #[serde(default)]
+    fork_cid: Option<u32>,
+    #[serde(default)]
+    pid_start_time: Option<u64>,
+    #[serde(default)]
+    fork_operation: Option<serde_json::Value>,
+    #[serde(default)]
+    fork_parent: Option<String>,
+    #[serde(default)]
+    fork_source_api: Option<String>,
+    #[serde(default)]
+    fork_previous_operations: Vec<String>,
+    #[serde(skip)]
+    pidfd: Option<std::sync::Arc<tokio::io::unix::AsyncFd<OwnedFd>>>,
     id: String,
     config: CloudHypervisorConfig,
     #[serde(skip)]
@@ -132,6 +153,18 @@ impl CloudHypervisorVM {
             virtiofsd_config.shared_dir = format!("{}/{}", base_dir, SHARED_DIR_SUFFIX);
         }
         Self {
+            fork_net: None,
+            live_fork: vm_config.live_fork,
+            fork_writable_seed: vm_config
+                .live_fork_writable_disk
+                .then(|| vm_config.common.image_path.clone()),
+            fork_cid: None,
+            pid_start_time: None,
+            fork_operation: None,
+            fork_parent: None,
+            fork_source_api: None,
+            fork_previous_operations: Vec::new(),
+            pidfd: None,
             id: id.to_string(),
             config,
             devices: vec![],
@@ -208,8 +241,47 @@ impl CloudHypervisorVM {
 
 #[async_trait]
 impl VM for CloudHypervisorVM {
+    fn live_fork_profile(&self) -> bool {
+        self.live_fork
+    }
+    fn live_fork_agent(&self) -> bool {
+        self.fork_cid.is_some()
+    }
+    fn live_fork_info(&self) -> serde_json::Value {
+        if !self.live_fork {
+            return serde_json::Value::Null;
+        }
+        serde_json::json!({"profile": if self.fork_cid.is_some() { "vsock-agent" } else { "serial-only" }, "serial_socket": self.fork_serial_path(),
+            "api_socket": self.config.api_socket, "parent_id": self.fork_parent,
+            "operation": self.fork_operation, "pid": self.pids.vmm_pid,
+            "guest_agent": self.fork_cid.is_some(), "cid": self.fork_cid})
+    }
+    async fn fork_from(&mut self, parent: &mut Self) -> Result<u32> {
+        self.fork_live_vm(parent).await
+    }
+    async fn finish_fork_disks(&self) -> Result<()> {
+        live_fork::wait_disk_retirement(&self.config.api_socket).await
+    }
+    async fn resume_fork(&mut self) -> Result<()> {
+        live_fork::request(&self.config.api_socket, "PUT", "vm.resume", None).await?;
+        Ok(())
+    }
+
     #[instrument(skip_all)]
     async fn start(&mut self) -> Result<u32> {
+        if self.live_fork && (self.pids.vmm_pid.is_some() || self.fork_parent.is_some()) {
+            return Err(anyhow!(
+                "live_fork VM is already started or inherited; create a new sandbox instead"
+            )
+            .into());
+        }
+        if let Some(seed) = &self.fork_writable_seed {
+            use std::os::unix::fs::PermissionsExt;
+            let metadata = std::fs::metadata(seed)?;
+            if !metadata.is_file() || metadata.permissions().mode() & 0o222 == 0 {
+                return Err(anyhow!("writable fork seed is not a writable regular file (sealed seeds cannot be booted again)").into());
+            }
+        }
         create_dir_all(&self.base_dir).await?;
         let _ = tokio::fs::remove_file(&self.config.api_socket).await;
         if self.container_storage_backend == ContainerStorageBackend::Virtiofs {
@@ -217,6 +289,15 @@ impl VM for CloudHypervisorVM {
             self.pids.affiliated_pids.push(virtiofsd_pid);
         }
         let mut params = self.config.to_cmdline_params("--");
+        if self.live_fork {
+            params.extend([
+                "--enable-fork".into(),
+                "--console".into(),
+                "off".into(),
+                "--serial".into(),
+                format!("socket={}", self.fork_serial_path()),
+            ]);
+        }
         for d in self.devices.iter() {
             params.extend(d.to_cmdline_params("--"));
         }
@@ -252,7 +333,7 @@ impl VM for CloudHypervisorVM {
         spawn_wait(
             child,
             format!("cloud-hypervisor {}", self.id),
-            Some(pid_file),
+            if self.live_fork { None } else { Some(pid_file) },
             Some(tx),
         );
 
@@ -266,11 +347,32 @@ impl VM for CloudHypervisorVM {
                 return Err(e);
             }
         };
+        if self.live_fork {
+            self.monitor_pidfd(pid.unwrap()).await?;
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                if let Ok(info) =
+                    live_fork::request(&self.config.api_socket, "GET", "vm.info", None).await
+                {
+                    if info["state"] == "Running" {
+                        break;
+                    }
+                }
+                if std::time::Instant::now() >= deadline {
+                    self.stop(true).await?;
+                    return Err(anyhow!("live_fork VM did not become Running").into());
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
         Ok(pid.unwrap_or_default())
     }
 
     #[instrument(skip_all)]
     async fn stop(&mut self, force: bool) -> Result<()> {
+        if self.live_fork {
+            return self.stop_fork_vm(force).await;
+        }
         let signal = if force {
             signal::SIGKILL
         } else {
@@ -307,6 +409,9 @@ impl VM for CloudHypervisorVM {
 
     #[instrument(skip_all)]
     async fn attach(&mut self, device_info: DeviceInfo) -> Result<()> {
+        if self.live_fork && !matches!(&device_info, DeviceInfo::Tap(_)) {
+            return Err(anyhow!("live_fork uses fixed devices and guest-resident container rootfs; device attachment is unsupported").into());
+        }
         match device_info {
             DeviceInfo::Block(blk_info) => {
                 let device = Disk::new(
@@ -318,6 +423,24 @@ impl VM for CloudHypervisorVM {
                 self.add_device(device);
             }
             DeviceInfo::Tap(tap_info) => {
+                if self.live_fork {
+                    if self.fork_net.is_some() {
+                        return Err(anyhow!("live fork supports one NIC").into());
+                    }
+                    let num_queues = 2 * tap_info.fds.len().max(1) as u32;
+                    self.fork_net = Some(
+                        serde_json::json!({"id": "fork-net", "tap": tap_info.name, "mac": tap_info.mac_address, "num_queues": num_queues}),
+                    );
+                    let mut device = VirtioNetDevice::new(
+                        "fork-net",
+                        Some(tap_info.name),
+                        &tap_info.mac_address,
+                        vec![],
+                    );
+                    device.num_queues = num_queues;
+                    self.add_device(device);
+                    return Ok(());
+                }
                 let mut fd_ints = vec![];
                 let mut raw_fds = vec![];
                 for fd in tap_info.fds {
@@ -368,6 +491,12 @@ impl VM for CloudHypervisorVM {
 
     #[instrument(skip_all)]
     async fn hot_attach(&mut self, device_info: DeviceInfo) -> Result<(BusType, String)> {
+        if self.live_fork {
+            return Err(anyhow!(
+                "live_fork device hotplug is unsupported; use guest-resident rootfs"
+            )
+            .into());
+        }
         let direct_io = self.direct_io;
         let client = self.get_client()?;
         let addr = client.hot_attach(device_info, direct_io)?;
@@ -387,6 +516,10 @@ impl VM for CloudHypervisorVM {
 
     #[instrument(skip_all)]
     async fn ping(&self) -> Result<()> {
+        if self.live_fork {
+            live_fork::request(&self.config.api_socket, "GET", "vm.info", None).await?;
+            return Ok(());
+        }
         if self.agent_socket.is_empty() {
             return Ok(());
         }
@@ -443,6 +576,9 @@ impl VM for CloudHypervisorVM {
 impl crate::vm::Recoverable for CloudHypervisorVM {
     #[instrument(skip_all)]
     async fn recover(&mut self) -> Result<()> {
+        if self.live_fork {
+            return self.monitor_pidfd(self.pid()?).await;
+        }
         let pid = self.pid()?;
         // Fast-fail: if the process is gone, skip the socket connect timeout.
         signal::kill(Pid::from_raw(pid as i32), None)

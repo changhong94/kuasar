@@ -141,6 +141,32 @@ pub trait Hooks<V: VM + Sync + Send> {
 
 #[async_trait]
 pub trait VM: Serialize + Sync + Send {
+    /// Restricted same-host fork profile; guest transport is separately opt-in.
+    fn live_fork_profile(&self) -> bool {
+        false
+    }
+    fn live_fork_agent(&self) -> bool {
+        false
+    }
+    fn live_fork_info(&self) -> serde_json::Value {
+        serde_json::Value::Null
+    }
+    async fn fork_from(&mut self, _parent: &mut Self) -> Result<u32>
+    where
+        Self: Sized,
+    {
+        Err(anyhow!("live VM fork is unsupported by this backend").into())
+    }
+    async fn resume_fork(&mut self) -> Result<()> {
+        Err(anyhow!("live VM fork is unsupported by this backend").into())
+    }
+
+    /// Await terminal disk barriers after both guests resume, before publishing
+    /// the fork to callers. Backends without deferred disk close need no gate.
+    async fn finish_fork_disks(&self) -> Result<()> {
+        Ok(())
+    }
+
     async fn start(&mut self) -> Result<u32>;
     async fn stop(&mut self, force: bool) -> Result<()>;
     async fn attach(&mut self, device_info: DeviceInfo) -> Result<()>;

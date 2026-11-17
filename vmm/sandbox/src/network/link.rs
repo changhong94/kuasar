@@ -480,7 +480,7 @@ fn get_bdf_for_eth(if_name: &str) -> Result<String> {
     Ok(bdf.to_string())
 }
 
-async fn create_tap_in_netns(
+pub(crate) async fn create_tap_in_netns(
     netns: &str,
     tap_name: &str,
     queue: u32,
@@ -535,7 +535,7 @@ fn create_tap_device(tap_name: &str, mut queue: u32) -> Result<Vec<OwnedFd>> {
     };
 
     // TODO: Remove IFF_VNET_HDR
-    let flags = IFF_TAP | IFF_NO_PI | IFF_MULTI_QUEUE | IFF_VNET_HDR;
+    let flags = IFF_TAP | IFF_NO_PI | IFF_VNET_HDR | if queue > 1 { IFF_MULTI_QUEUE } else { 0 };
 
     let req = ifreq {
         ifr_name: if_name_arr,

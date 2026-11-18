@@ -99,21 +99,22 @@ class DurableState:
         if not isinstance(records, dict) or any(not isinstance(k, str) for k in records):
             raise ValueError('Durable state must map string sandbox IDs to records')
         selected = records if only is None else {sid: records[sid] for sid in only}
-        encoded = json.dumps(selected, separators=(',', ':'))
+        entries = [(key, json.dumps(value, separators=(',', ':')))
+                   for key, value in selected.items()]
+        encoded = '{' + ','.join(json.dumps(key)+':'+value for key, value in entries) + '}'
         serialized_ns = time.perf_counter_ns()
         self.db.execute('BEGIN IMMEDIATE')
         begun_ns = time.perf_counter_ns()
         try:
-            # Parse the one serialized document in SQLite, then write only
-            # changed records. json_each already provides object/array JSON;
-            # avoid rescanning the whole document for every sandbox. -> is
-            # needed only for scalar records to retain types/large integer text.
+            # Bind IDs and exact JSON text separately. SQLite 3.42 cannot
+            # reliably resolve json_each.fullkey paths containing quotes;
+            # scalar extraction can also round arbitrary-precision integers.
+            # Serialize each value once, retaining the existing transaction and
+            # changed-row-only updates without interpreting IDs as JSON paths.
             before = self.db.total_changes
-            self.db.execute("""INSERT INTO state_records(id,value)
-                SELECT key, CASE WHEN type IN ('object','array') THEN value
-                    ELSE ? -> fullkey END FROM json_each(?) WHERE true
+            self.db.executemany("""INSERT INTO state_records(id,value) VALUES(?, ?)
                 ON CONFLICT(id) DO UPDATE SET value=excluded.value
-                WHERE state_records.value != excluded.value""", (encoded, encoded))
+                WHERE state_records.value != excluded.value""", entries)
             changed_count = self.db.total_changes - before
             before = self.db.total_changes
             if only is None:

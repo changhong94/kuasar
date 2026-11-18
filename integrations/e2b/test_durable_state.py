@@ -115,6 +115,28 @@ class DurableStateTests(unittest.TestCase):
             self.assertEqual(store.db.total_changes, before)
             store.close()
 
+    def test_partial_scalar_updates_with_escaped_ids_survive_reopen(self):
+        for mode in ('PERSIST', 'WAL'):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as d:
+                from unittest.mock import patch
+                with patch.dict(os.environ, {'E2B_SQLITE_JOURNAL': mode}):
+                    path = Path(d)/'state'
+                    store = DurableState(path)
+                    records = {'quote".\\[]': 10**50, '': None, 'kept': {'value': 1}}
+                    store.save(records)
+                    records['quote".\\[]'] = -(10**80)
+                    records[''] = False
+                    store.save(records, only=['quote".\\[]', ''])
+                    self.assertEqual(store.load(), records)
+                    before = store.db.total_changes
+                    store.save(records, only=['quote".\\[]'])
+                    self.assertEqual(store.db.total_changes, before)
+                    store.close()
+                    store = DurableState(path)
+                    self.assertEqual(store.load(), records)
+                    self.assertEqual(json.loads(path.read_text()), records)
+                    store.close()
+
     def test_separate_sqlite_root_keeps_generation_and_reopens_without_option(self):
         from unittest.mock import patch
         with tempfile.TemporaryDirectory() as d:

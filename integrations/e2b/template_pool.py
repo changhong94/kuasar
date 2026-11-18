@@ -13,7 +13,7 @@ import time
 from pathlib import Path
 from server import APIError, trace_timing
 
-PRIVATE = ('preparing', 'ready', 'binding', 'quarantined')
+PRIVATE = ('preparing', 'ready', 'binding', 'quarantined', 'network_idle')
 
 
 class TemplatePool:
@@ -63,10 +63,21 @@ class TemplatePool:
         try:
             sid = self.backend._create_live({'timeout': 86400}, _pool_owned=True)
             job = self.backend.jobs[sid]
+            # Device discovery is image-independent and may overlap CNI ADD.
+            # Snapshot preparation freezes the guest, so it must still wait for
+            # network completion; neither failure can publish a Ready slot.
+            device = getattr(self.backend, "prepare_slot_device", None)
+            if device:
+                device(sid)
             job.result(timeout=50)
+            if self.backend.get(sid).get('network_state') != 'ready':
+                raise RuntimeError('prepared slot network failed')
             prepare = getattr(self.backend, "prepare_slot", None)
             if prepare:
-                prepare(sid)
+                if device:
+                    prepare(sid, device_prepared=True)
+                else:
+                    prepare(sid)
             with self.condition:
                 record = self.backend.get(sid)
                 if record.get('status') != 'running' or record.get('network_state') != 'ready':
@@ -128,7 +139,7 @@ class TemplatePool:
                     self.condition.wait(1)
 
     def lease(self, body, *, private=False, binding=None):
-        if binding and (not private or set(binding)-{'template_id', 'image_disk', 'image_sha256', 'image_manifest'}):
+        if binding and (not private or set(binding)-{'template_id', 'image_disk', 'image_sha256', 'image_manifest', 'snapshot_template'}):
             raise ValueError('Image binding must be a private assignment')
         started = time.monotonic()
         deadline = started+45
@@ -166,6 +177,15 @@ class TemplatePool:
                         raise
                     trace_timing('pool_assignment_save', save_start_ns, sid=sid)
                     self.leases += 1
+                    # A successful lease consumes Ready capacity. Start the
+                    # configured refill delay now, while the capacity guard in
+                    # _run still counts this lease until retirement completes.
+                    # Do not add another full delay after synchronous deletion.
+                    if self.due is None:
+                        self.due = time.monotonic()+self.refill_delay
+                        self._event('refill_scheduled', sid=sid, trigger='lease',
+                                    delay_ms=self.refill_delay*1000)
+                    self.condition.notify_all()
                     response = sid if private else self.backend.response(sid)
                     self._event('leased', sid=sid, elapsed_ms=(time.monotonic()-started)*1000,
                                 waited=counted_miss)

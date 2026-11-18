@@ -2,11 +2,13 @@
 """Default E2B backend: live Kuasar VMs with independently progressing CNI."""
 import base64
 import concurrent.futures
+from contextlib import nullcontext
 import datetime
 import json
 import os
 from pathlib import Path
 import secrets
+import select
 import signal
 import subprocess
 import threading
@@ -29,11 +31,19 @@ class VMBackend(CheckpointBackend, Backend):
         self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix='e2b-cni')
         self.closed = threading.Event()
         self.template_pool = None
+        self.network_pool = None
+        if os.environ.get('E2B_SLOT_NETWORK_POOL') == '1':
+            from network_pool import NetworkPool
+            self.network_pool = NetworkPool(self)
         for sid, record in list(self.records.items()):
             if record.get('host_boot_id') not in (None, self.boot_id):
                 record['netns'] = ''
                 for field in ('holder_pid', 'holder_start', 'holder_inode'):
                     record.pop(field, None)
+            if record.get('network_only'):
+                record['status'] = 'deleting'  # Never adopt idle resources across adapter epochs.
+                continue
+
             if record.get('backend') != 'vm':
                 raise ValueError('state file belongs to a different backend')
             if record.get('pool_state') in ('preparing', 'ready', 'binding', 'quarantined'):
@@ -78,7 +88,7 @@ class VMBackend(CheckpointBackend, Backend):
         # Never reassign an unclaimed slot across adapter epochs. Reconcile its
         # durable ownership first; leased user sandboxes keep normal recovery.
         for sid, record in list(self.records.items()):
-            if record.get('pool_state') in ('preparing', 'ready', 'binding', 'quarantined'):
+            if record.get('network_only') or record.get('pool_state') in ('preparing', 'ready', 'binding', 'quarantined'):
                 self.destroy(sid)
         capacity = int(os.environ.get('E2B_TEMPLATE_POOL_SIZE', '0'))
         if capacity:
@@ -89,7 +99,7 @@ class VMBackend(CheckpointBackend, Backend):
     def get_public(self, sid):
         with self.lock:
             record = self.get(sid)
-            if record.get('pool_state') in ('preparing', 'ready', 'binding', 'quarantined'):
+            if record.get('network_only') or record.get('pool_state') in ('preparing', 'ready', 'binding', 'quarantined'):
                 raise APIError(404, 'Sandbox not found')
             return record
 
@@ -153,7 +163,7 @@ class VMBackend(CheckpointBackend, Backend):
             ns = ''
         if action == 'ADD' and not ns:
             raise RuntimeError('owned network namespace is missing')
-        env = {**os.environ, 'CNI_COMMAND': action, 'CNI_CONTAINERID': sid,
+        env = {**os.environ, 'CNI_COMMAND': action, 'CNI_CONTAINERID': r.get('cni_owner', sid),
                'CNI_NETNS': ns, 'CNI_IFNAME': 'eth0', 'CNI_PATH': self.args.cni_bin}
         if action == 'ADD' and r.get('checkpoint_ip'):
             env['CNI_ARGS'] = 'IgnoreUnknown=1;IP='+r['checkpoint_ip']
@@ -244,6 +254,9 @@ class VMBackend(CheckpointBackend, Backend):
                         raise APIError(409, 'Source network is not ready for another fork')
             source = parent or self.args.source
             sid = 'e2b-'+secrets.token_hex(12)
+            direct = _pool_owned and getattr(self, 'direct_pool_prepare', False)
+            networks = getattr(self, 'network_pool', None) if direct else None
+            reservation = None
             with self.lock:
                 self.operations[sid] = threading.RLock()
                 self.records[sid] = {'backend': 'vm', 'host_boot_id': self.boot_id, 'status': 'creating', 'network_state': 'pending',
@@ -260,7 +273,13 @@ class VMBackend(CheckpointBackend, Backend):
                 elif _private:
                     self.records[sid]['pool_state'] = 'preparing'
                 try:
-                    self.save()
+                    # Creation and idle-network ownership transfer are a single
+                    # durable transaction. No external side effect precedes it.
+                    # Cold slots without an idle network keep the normal commit.
+                    if networks:
+                        reservation = networks.reserve(sid)
+                    if reservation is None:
+                        self.save()
                 except Exception:
                     self.records[sid]['status'] = 'deleting'
                     try:
@@ -273,18 +292,54 @@ class VMBackend(CheckpointBackend, Backend):
                 try:
                     trace_timing('create_record', started_ns, sid=sid)
                     ns_start = time.perf_counter_ns()
-                    ns = self.namespace(sid)
-                    trace_timing('namespace', ns_start, sid=sid)
-                    info = self.admin('sandbox-fork', source_id=source, sandbox_id=sid, netns=ns, defer_network=True)
+                    # Only a private RAM-less VMM may overlap old-flow cleanup.
+                    # Context exit joins cleanup before Running/Ready persistence,
+                    # and before the exception path can destroy this generation.
+                    with networks.claim_preparing(sid, reservation, native_identity=direct) if networks else nullcontext(None) as ns:
+                        reused = ns is not None
+                        if ns is None:
+                            ns = self.namespace(sid)
+                            if networks:
+                                networks.run(['sysctl', '-qw', 'net.ipv6.conf.all.disable_ipv6=1',
+                                              'net.ipv6.conf.default.disable_ipv6=1',
+                                              'net.ipv4.conf.default.arp_notify=1'], self.get(sid))
+                        trace_timing('namespace', ns_start, sid=sid, reused=reused)
+                        if direct:
+                            # The empty VMM has no guest agent to configure. Finish
+                            # CNI before native network discovery; native preparation
+                            # keeps forwarding blocked until snapshot identity reset.
+                            if not reused:
+                                with self.lock:
+                                    self.get(sid).update(cni_owner=sid, network_slot='net-'+secrets.token_hex(12), network_generation=1)
+                                    self.save()
+                                self.cni_call(sid, 'ADD')
+                                if networks:
+                                    networks.capture_routes(sid)
+                            ip = self.address(self.get(sid))
+                            if not ip:
+                                raise RuntimeError('prepared pool namespace has no IPv4 address')
+                            info = self.admin('sandbox-pool-prepare', source_id=source, sandbox_id=sid, netns=ns,
+                                              network_identity='fresh')
+                            if info.get('network_identity') != 'fresh':
+                                raise RuntimeError('native pool preparation did not confirm fresh network identity')
+                        else:
+                            info = self.admin('sandbox-fork', source_id=source, sandbox_id=sid, netns=ns, defer_network=True)
                     completion_ns = time.perf_counter_ns()
                     with self.lock:
                         trace_timing('completion_lock_wait', completion_ns, sid=sid)
                         save_ns = time.perf_counter_ns()
                         self.records[sid].update(status='running', pid=info['live_fork']['pid'],
                             vsock_socket=info['live_fork'].get('vsock_socket', str(Path(self.args.sandbox_state)/sid/'task.vsock')))
+                        if direct:
+                            self.records[sid].update(direct_prepared=True, network_state='ready', ip=ip)
                         self.save()
                         trace_timing('running_record', save_ns, sid=sid)
-                        self.jobs[sid] = self.pool.submit(self.provision, sid)
+                        if direct:
+                            job = concurrent.futures.Future()
+                            job.set_result(None)
+                            self.jobs[sid] = job
+                        else:
+                            self.jobs[sid] = self.pool.submit(self.provision, sid)
                     response = sid if (_pool_owned or _private) else self.response(sid)
                     trace_timing('create_total', started_ns, sid=sid)
                     return response
@@ -292,8 +347,32 @@ class VMBackend(CheckpointBackend, Backend):
                     self.destroy(sid)
                     raise
 
+    @staticmethod
+    def wait_holder(holder):
+        # Popen.wait(timeout) uses exponentially backed-off sleeps on POSIX.
+        # pidfd readiness gives the same exit barrier and bounded wait without
+        # adding polling delay. The owned child remains unreaped until wait().
+        if holder.poll() is not None:
+            return
+        fd = os.pidfd_open(holder.pid)
+        try:
+            poll = select.poll()
+            poll.register(fd, select.POLLIN)
+            if not poll.poll(5000):
+                raise subprocess.TimeoutExpired(holder.args, 5)
+            holder.wait()
+        finally:
+            os.close(fd)
+
     def destroy(self, sid):
+        began = last = time.perf_counter_ns()
+        def mark(stage):
+            nonlocal last
+            now = time.perf_counter_ns()
+            trace_timing('delete_'+stage, last, sid=sid)
+            last = now
         with self.operation(sid):
+            mark('operation_wait')
             with self.lock:
                 r = self.get(sid)
                 was_pooled = bool(r.get('pool_origin'))
@@ -301,42 +380,72 @@ class VMBackend(CheckpointBackend, Backend):
                 r['status'] = 'deleting'
                 self.save()
                 job = self.jobs.get(sid)
+            mark('intent_commit')
             # A running ADD must finish before DEL. No records lock is held while
             # waiting; the worker can observe deletion and skip guest activation.
             if job:
                 job.cancel()
                 if not job.cancelled():
                     job.result(timeout=50)
+            mark('join_network')
             try:
-                self.admin('sandbox-get', sandbox_id=sid)
-            except RuntimeError as error:
-                if 'not found' not in str(error):
-                    raise
-            else:
+                # Destroy resolves the exact ID under the native lifecycle lock.
+                # A separate GET adds a round trip and is not an ownership guard.
                 self.admin('sandbox-destroy', sandbox_id=sid)
-            self.cni_call(sid, 'DEL')
+            except RuntimeError as error:
+                if str(error) != f'sandbox {sid} not found':
+                    raise
+            mark('native_destroy')
+            networks = getattr(self, 'network_pool', None)
+            idle = networks.retire(sid) if networks else None
+            mark('network_reset')
+            if idle is None:
+                self.cni_call(sid, 'DEL')
+                mark('cni_del')
+                with self.lock:
+                    r = dict(self.get(sid))
+                holder = self.holders.pop(sid, None)
+                if holder is not None:
+                    holder.terminate()
+                    self.wait_holder(holder)
+                elif r.get('holder_pid'):
+                    try:
+                        if self.process_start(r['holder_pid']) == r['holder_start']:
+                            os.kill(r['holder_pid'], signal.SIGTERM)
+                    except FileNotFoundError:
+                        pass
+                mark('holder_stop')
+                path = Path('/var/run/netns')/r['namespace']
+                if path.exists():
+                    subprocess.run(['ip', 'netns', 'delete', r['namespace']], check=True, capture_output=True, timeout=10)
+                mark('namespace_delete')
             with self.lock:
-                r = dict(self.get(sid))
-            holder = self.holders.pop(sid, None)
-            if holder is not None:
-                holder.terminate()
-                holder.wait(timeout=5)
-            elif r.get('holder_pid'):
-                try:
-                    if self.process_start(r['holder_pid']) == r['holder_start']:
-                        os.kill(r['holder_pid'], signal.SIGTERM)
-                except FileNotFoundError:
-                    pass
-            path = Path('/var/run/netns')/r['namespace']
-            if path.exists():
-                subprocess.run(['ip', 'netns', 'delete', r['namespace']], check=True, capture_output=True, timeout=10)
-            with self.lock:
+                if idle is not None:
+                    key = idle['network_slot']
+                    if key in self.records:
+                        raise RuntimeError('network slot has another owner')
+                    self.records[key] = idle
+                    if sid in self.holders:
+                        self.holders[key] = self.holders.pop(sid)
                 del self.records[sid]
                 self.jobs.pop(sid, None)
                 self.operations.pop(sid, None)
-                self.save()
+                try:
+                    self.save()
+                except Exception:
+                    if idle is not None:
+                        # An ambiguous handoff commit must never expose a reusable
+                        # network. Recovery and the reaper destroy this resource.
+                        idle.update(status='deleting', pool_state='quarantined', pool_origin=True)
+                        try:
+                            self.save()
+                        except Exception:
+                            pass
+                    raise
                 if self.template_pool is not None and was_pooled:
                     self.template_pool.capacity_changed(sid, assigned=was_assigned)
+            mark('record_remove')
+        trace_timing('delete_total', began, sid=sid)
 
     def execute(self, sid, argv, stdin=b''):
         # Serialize active command IO against fork/destroy of this VM. Network

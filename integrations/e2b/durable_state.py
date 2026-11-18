@@ -8,6 +8,7 @@ Records are stored per sandbox to avoid rewriting the entire pool on one lease.
 The old single-row schema is migrated atomically; state is now a read-only view.
 """
 import json
+import fcntl
 import os
 from pathlib import Path
 import sqlite3
@@ -49,17 +50,32 @@ class DurableState:
         # Use the canonical path so SQLite's WAL/SHM are colocated with the DB.
         # The durable link remains authoritative even if the option is unset.
         self.db_path = self.db_path.resolve(strict=False)
+        mode = os.environ.get('E2B_SQLITE_JOURNAL', 'PERSIST').upper()
+        background = mode == 'WAL' and os.environ.get('E2B_SQLITE_CHECKPOINT') == 'background'
+        self.owner = None
+        if background:
+            # NORMAL allows our checkpoint connection, but the adapter remains
+            # a single writer. Keep a process-lifetime, non-inherited owner lock.
+            self.owner = os.fdopen(os.open(str(self.db_path)+'.owner',
+                os.O_CREAT | os.O_RDWR | os.O_CLOEXEC, 0o600), 'a+b')
+            try:
+                fcntl.flock(self.owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BaseException:
+                self.owner.close()
+                raise
         self.db = sqlite3.connect(self.db_path, isolation_level=None,
                                   check_same_thread=False, timeout=30)
         os.chmod(self.db_path, 0o600)
-        mode = os.environ.get('E2B_SQLITE_JOURNAL', 'PERSIST').upper()
         if mode not in ('PERSIST', 'WAL'):
             raise ValueError('Unsupported durable journal mode')
         actual = self.db.execute('PRAGMA journal_mode='+mode).fetchone()[0]
         if actual.upper() != mode:
             raise RuntimeError('Requested durable journal mode unavailable')
         self.db.execute('PRAGMA synchronous=EXTRA')
-        self.db.execute('PRAGMA locking_mode=EXCLUSIVE')
+        self.db.execute('PRAGMA locking_mode='+('NORMAL' if background else 'EXCLUSIVE'))
+        if background:
+            self.db.execute('PRAGMA wal_autocheckpoint=0')
+        self.checkpointer = None
         kind = self.db.execute("SELECT type FROM sqlite_master WHERE name='state'").fetchone()
         if kind is None or kind[0] == 'table':
             row = self.db.execute('SELECT value FROM state WHERE id=1').fetchone() if kind else None
@@ -87,6 +103,8 @@ class DurableState:
                 finally:
                     os.close(fd)
         self.project(self.load())
+        if background:
+            self.checkpointer = WALCheckpointer(self.db_path)
 
     def load(self):
         row = self.db.execute('SELECT value FROM state WHERE id=1').fetchone()
@@ -96,6 +114,8 @@ class DurableState:
 
     def save(self, records, *, only=None):
         started_ns = time.perf_counter_ns()
+        if self.checkpointer:
+            self.checkpointer.before_commit()
         if not isinstance(records, dict) or any(not isinstance(k, str) for k in records):
             raise ValueError('Durable state must map string sandbox IDs to records')
         selected = records if only is None else {sid: records[sid] for sid in only}
@@ -129,6 +149,8 @@ class DurableState:
         # The durable transaction must finish before acknowledgment. Loss of this
         # derived view on crash is repaired before serving the next request.
         committed_ns = time.perf_counter_ns()
+        if self.checkpointer and (changed_count or removed_count):
+            self.checkpointer.committed()
         if only is not None:
             # The projection comes from committed rows, not other in-memory
             # records that a caller may still be modifying. No Python cache.
@@ -158,4 +180,98 @@ class DurableState:
         os.replace(tmp, self.path)
 
     def close(self):
-        self.db.close()
+        try:
+            if self.checkpointer:
+                self.checkpointer.close()
+        finally:
+            try:
+                self.db.close()
+            finally:
+                if self.owner:
+                    self.owner.close()
+
+
+class WALCheckpointer:
+    """Checkpoint debt is asynchronous; commit durability is never asynchronous.
+
+    Use a separate SQLite connection and PASSIVE checkpoints, which do not wait
+    for readers/writers. Bounded uncheckpointed commit count applies backpressure
+    instead of silently accumulating debt when readers or I/O prevent progress.
+    """
+    MAX_PENDING = 1024
+    WAKE_COMMITS = 64
+
+    def __init__(self, path):
+        self.path = path
+        self.condition = threading.Condition()
+        self.wake = threading.Event()
+        self.stopping = False
+        self.error = None
+        self.serial = 0
+        self.completed = 0
+        self.last_result = None
+        self.worker = threading.Thread(target=self.run, name='sqlite-checkpoint', daemon=True)
+        self.worker.start()
+
+    def before_commit(self):
+        with self.condition:
+            if self.serial-self.completed >= self.MAX_PENDING:
+                self.wake.set()
+                if not self.condition.wait_for(lambda: self.error is not None or
+                        self.serial-self.completed < self.MAX_PENDING, timeout=30):
+                    raise RuntimeError('WAL checkpoint debt did not drain')
+            if self.error is not None:
+                raise RuntimeError('WAL checkpoint failed') from self.error
+            if self.stopping:
+                raise RuntimeError('Durable state is closing')
+
+    def committed(self):
+        with self.condition:
+            self.serial += 1
+            if self.serial-self.completed >= self.WAKE_COMMITS:
+                self.wake.set()
+
+    def run(self):
+        db = None
+        try:
+            db = sqlite3.connect(self.path, isolation_level=None, timeout=0)
+            db.execute('PRAGMA synchronous=EXTRA')
+            db.execute('PRAGMA wal_autocheckpoint=0')
+            while True:
+                self.wake.wait(.25)
+                self.wake.clear()
+                with self.condition:
+                    target = self.serial
+                    stop = self.stopping
+                    pending = target > self.completed
+                if pending or stop:
+                    started = time.perf_counter_ns()
+                    result = db.execute('PRAGMA wal_checkpoint(PASSIVE)').fetchone()
+                    with self.condition:
+                        self.last_result = result
+                        if result[0] == 0 and result[1] == result[2]:
+                            self.completed = target
+                        self.condition.notify_all()
+                    if os.environ.get('E2B_TRACE_TIMING'):
+                        print('E2B_TIMING '+json.dumps(dict(stage='wal_checkpoint',
+                            started_ns=started, ended_ns=time.perf_counter_ns(),
+                            elapsed_ms=(time.perf_counter_ns()-started)/1e6,
+                            busy=result[0], log_frames=result[1], checkpointed_frames=result[2],
+                            target_commit=target, thread=threading.get_native_id())), flush=True)
+                if stop:
+                    break
+        except BaseException as error:
+            with self.condition:
+                self.error = error
+                self.condition.notify_all()
+        finally:
+            if db is not None:
+                db.close()
+
+    def close(self):
+        with self.condition:
+            self.stopping = True
+            self.wake.set()
+        self.worker.join()
+        if self.error is not None:
+            raise RuntimeError('WAL checkpoint failed') from self.error

@@ -53,6 +53,37 @@ pub struct Network {
     deferred_parent_ips: Vec<String>,
 }
 
+/// Refresh a private generic slot before discovering its guest transport config.
+/// The caller owns this namespace and has not started or restored a guest.
+pub(crate) async fn refresh_pool_identity(netns: &str) -> Result<()> {
+    use netlink_packet_route::link::{InfoKind, LinkAttribute, LinkInfo};
+    let handle = create_netlink_handle(netns).await?;
+    let link = handle
+        .link()
+        .get()
+        .match_name("eth0".into())
+        .execute()
+        .try_next()
+        .await
+        .map_err(|e| anyhow!("resolve pool veth: {e}"))?
+        .ok_or_else(|| anyhow!("pool veth disappeared"))?;
+    let veth = link.attributes.iter().any(|attribute| matches!(attribute,
+        LinkAttribute::LinkInfo(info) if info.iter().any(|i| matches!(i, LinkInfo::Kind(InfoKind::Veth)))));
+    if !veth {
+        return Err(anyhow!("fresh pool identity requires a veth").into());
+    }
+    let mut mac = rand::random::<[u8; 6]>();
+    mac[0] = (mac[0] & 0xfe) | 0x02;
+    handle
+        .link()
+        .set(link.header.index)
+        .address(mac.to_vec())
+        .execute()
+        .await
+        .map_err(|e| anyhow!("refresh pool MAC: {e}"))?;
+    Ok(())
+}
+
 async fn get_route(
     ip_version: IpVersion,
     handle: &Handle,
@@ -167,9 +198,14 @@ impl Network {
             return Err(anyhow!("deferred namespace must initially be empty").into());
         }
         let handle = create_netlink_handle(&config.netns).await?;
-        let tap =
-            link::create_tap_in_netns(&config.netns, "forktap0", config.queue, parent.intfs[0].mtu, &handle)
-                .await?;
+        let tap = link::create_tap_in_netns(
+            &config.netns,
+            "forktap0",
+            config.queue,
+            parent.intfs[0].mtu,
+            &handle,
+        )
+        .await?;
         let mut mac: [u8; 6] = rand::random();
         mac[0] = (mac[0] & 0xfe) | 0x02;
         let mut intf = NetworkInterface {
@@ -347,19 +383,23 @@ impl Network {
                 .twin
                 .as_ref()
                 .ok_or_else(|| anyhow!("fork networking requires a CNI veth/TAP pair"))?;
+            let handle = create_netlink_handle(&self.config.netns).await?;
+            let link = handle
+                .link()
+                .get()
+                .match_name(tap.name.clone())
+                .execute()
+                .try_next()
+                .await
+                .map_err(|e| anyhow!("resolve fork TAP: {e}"))?
+                .ok_or_else(|| anyhow!("fork TAP disappeared"))?;
             if block {
-                let mut cmd = std::process::Command::new("tc");
-                cmd.args([
-                    "filter", "add", "dev", &tap.name, "ingress", "pref", "1", "matchall",
-                    "action", "drop",
-                ]);
-                execute_in_netns(&self.config.netns, cmd).await?;
+                netlink::add_fork_drop_filter(handle, link.header.index)
+                    .await
+                    .map_err(|e| anyhow!("install fork network barrier: {e}"))?;
             } else {
-                let handle = create_netlink_handle(&self.config.netns).await?;
-                let link = handle.link().get().match_name(tap.name.clone()).execute()
-                    .try_next().await.map_err(|e| anyhow!("resolve fork TAP: {e}"))?
-                    .ok_or_else(|| anyhow!("fork TAP disappeared"))?;
-                netlink::delete_fork_drop_filter(handle, link.header.index).await
+                netlink::delete_fork_drop_filter(handle, link.header.index)
+                    .await
                     .map_err(|e| anyhow!("release fork network barrier: {e}"))?;
             }
         }

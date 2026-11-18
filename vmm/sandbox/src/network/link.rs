@@ -44,7 +44,7 @@ use crate::{
     device::{DeviceInfo, PhysicalDeviceInfo, TapDeviceInfo, VhostUserDeviceInfo},
     network::{
         address::{CniIPAddress, IpNet, MacAddress},
-        create_netlink_handle, execute_in_netns, run_in_new_netns,
+        create_netlink_handle, run_in_new_netns,
     },
     sandbox::KuasarSandbox,
     utils::write_file_async,
@@ -316,10 +316,19 @@ impl NetworkInterface {
                 let tap_name = format!("tap_kua_{}", self.index);
                 let tap_intf =
                     create_tap_in_netns(netns, &tap_name, self.queue, self.mtu, &handle).await?;
-                tap_intf.add_qdisc_ingress(netns, &handle).await?;
-                self.add_qdisc_ingress(netns, &handle).await?;
-                tap_intf.add_redirect_tc_filter(netns, &self.name).await?;
-                self.add_redirect_tc_filter(netns, &tap_intf.name).await?;
+                // No subprocesses: retain ordered, acknowledged kernel operations.
+                super::netlink::add_ingress(handle.clone(), tap_intf.index)
+                    .await
+                    .map_err(|e| anyhow!("TAP ingress: {e}"))?;
+                super::netlink::add_ingress(handle.clone(), self.index)
+                    .await
+                    .map_err(|e| anyhow!("veth ingress: {e}"))?;
+                super::netlink::add_redirect(handle.clone(), tap_intf.index, self.index)
+                    .await
+                    .map_err(|e| anyhow!("TAP redirect: {e}"))?;
+                super::netlink::add_redirect(handle, self.index, tap_intf.index)
+                    .await
+                    .map_err(|e| anyhow!("veth redirect: {e}"))?;
                 self.twin = Some(Box::new(tap_intf));
             }
             LinkType::Physical(bdf, _driver) => {
@@ -391,42 +400,6 @@ impl NetworkInterface {
         if let LinkType::Physical(bdf, driver) = &self.r#type {
             bind_device_to_driver(driver, bdf).await?
         }
-        Ok(())
-    }
-
-    async fn add_qdisc_ingress(&self, netns: &str, _handle: &Handle) -> Result<()> {
-        // TODO use netlink to add ingress
-        let mut cmd = std::process::Command::new("tc");
-        cmd.args(["qdisc", "add", "dev", &*self.name, "ingress"]);
-        execute_in_netns(netns, cmd).await?;
-        Ok(())
-    }
-
-    async fn add_redirect_tc_filter(&self, netns: &str, dest: &str) -> Result<()> {
-        // TODO do this with netlink library
-        let mut cmd = std::process::Command::new("tc");
-        cmd.args([
-            "filter",
-            "add",
-            "dev",
-            &*self.name,
-            "parent",
-            "ffff:",
-            "protocol",
-            "all",
-            "u32",
-            "match",
-            "u8",
-            "0",
-            "0",
-            "action",
-            "mirred",
-            "egress",
-            "redirect",
-            "dev",
-            dest,
-        ]);
-        execute_in_netns(netns, cmd).await?;
         Ok(())
     }
 }

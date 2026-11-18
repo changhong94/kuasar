@@ -300,8 +300,46 @@ expiry before responding. Ready/preparing/quarantined slots are not accessible
 through sandbox or guest APIs. Capacity includes assigned and retiring members;
 deleting a member opens capacity for serial background refill. Exhaustion waits
 up to 45 seconds and returns 503 if no slot becomes available. The default
-`E2B_TEMPLATE_POOL_REFILL_DELAY_MS=1000` coalesces deletion bursts; report this
-refill delay separately, not as zero-cost capacity. There is no tenant recycling.
+`E2B_TEMPLATE_POOL_REFILL_DELAY_MS=1000` starts when a successful lease consumes
+Ready capacity. Refilling still waits for completed retirement to release owned
+capacity; it does not restart the full delay after deletion. Recovery/retirement
+without a pending lease deadline starts a fresh delay. Report the configured
+delay, actual preparation work and client-observed pool recovery separately.
+There is no tenant recycling. DELETE remains synchronous: it confirms VM exit,
+CNI DEL, namespace cleanup and durable record removal before returning.
+
+Optional `E2B_SLOT_NETWORK_POOL=1` retains network resources for direct file-
+snapshot slots. It requires a single IPv4 `bridge` / `host-local` CNI config,
+no NAT or CNI extensions, and `conntrack` (override with `E2B_CONNTRACK_BIN`).
+Unsupported configurations fail closed when enabled; leave it disabled for the
+ordinary per-sandbox CNI lifecycle. It does not change explicit live-parent forks.
+
+A network slot owns its namespace holder, veth, persistent TAP and CNI allocation.
+Its IP is stable across generations, but each replacement gets a fresh sandbox
+ID, access token, CID and MAC. After confirmed VM exit, old redirects and
+neighbour entries are cleared, and conntrack is flushed
+inside the owned namespace. Host-side deletion selects only that slot's IP;
+it never flushes the host conntrack table. Independent cleanup operations run
+concurrently and are all joined, even on failure, before ownership can move.
+Late entries are cleared again on
+claim. Administrative link state and CNI routes are retained: there is no
+link down/up cycle. Routes are captured in the durable slot record. The new MAC is announced through
+ARP notification. Snapshot identity
+reset and the TAP gate remain prerequisites for forwarding to the new guest.
+Snapshot connection setup verifies a read-only guest `Check` before sending the
+identity mutation. Transport probes may reconnect; identity changes are never
+blindly retried, and the existing overall/identity deadlines remain unchanged.
+
+Retirement removes the old sandbox identity and durably creates a private idle
+network record in one transaction. Claim atomically transfers ownership and
+increments its generation. Failed handoff commits quarantine the resource.
+Idle resources are inaccessible through sandbox APIs, are reclaimed on adapter
+recovery, and are fully removed by pool drain. DELETE remains synchronous for VM
+retirement and network reset; it no longer removes retained pool namespaces.
+Report this separately from asynchronous delete acknowledgment and from draining
+all pool-owned network resources. Reusing an IP is not a promise to reject all
+future unsolicited traffic to that address; old guest processes, sockets and
+connection-tracking state are not transferred to the next generation.
 
 Explicit `/sandboxes/{parent}/fork` always derives the parent's current state;
 it never consumes a template slot. At adapter recovery, private slots are
@@ -376,9 +414,8 @@ a bound VM is never reassigned to a different tenant or image.
 This interface provides a Linux command environment from an application's
 filesystem. Legacy disk-only entries need a compatible architecture, `/bin/sh`, and the commands
 required by the SDK; a static busybox helper is supplied for SDK operations.
-Legacy disk-only entries do not start OCI ENTRYPOINT/CMD or apply OCI defaults;
-use the OCI import path below for those fields. Neither path restores a separate
-image-specific process checkpoint. The common
+Disk-only catalog entries are rejected: every image must use the OCI import
+path and carry execution configuration. The common
 guest kernel and runtime remain shared implementation choices. Per-image disk
 artifacts still require preparation, but no per-image VM pool is required.
 The writable overlay is guest RAM, matching the existing read-only-root research
@@ -390,18 +427,22 @@ fork path. Changing template ID in that request is rejected. Existing fork safet
 barriers, filesystem synchronization and durable assignment commits are retained.
 No `memory.img` or eager RAM copy is added. Network identities remain independent.
 Pool exhaustion returns an error after the existing bounded wait rather than
-silently returning the bare runtime. `E2B_FIXED_IMAGE` is a comparison-only mode:
-it binds one catalog image to the seed before pool preparation, and accepts only
-that image. Report its image binding and warmup as preparation costs.
+silently returning the bare runtime. `E2B_FIXED_IMAGE`, nonzero
+`E2B_TEMPLATE_READ_CACHE_BYTES`, and image-specific `startup_read_files` are
+rejected. There are no executable/library pre-read lists.
 
 ## OCI import and application startup
 
 `oci_import.py SOURCE --name IMAGE_ID --store DIR --catalog FILE` imports a
 skopeo transport (for example a digest-pinned `docker://` reference or an OCI
-layout). It resolves linux/amd64, verifies manifest/config/layer descriptors,
-unpacks whiteouts with umoci, constructs a read-only ext4 disk, and records both
+layout). It selects the host architecture (or explicit `--architecture`),
+requires Linux and verifies manifest/config/layer descriptors. It unpacks
+whiteouts with umoci, constructs a read-only disk, and records both
 manifest and config digests. It fsyncs the disk and metadata before atomically
 publishing the catalog under a file lock. Failed imports never publish an ID.
+All images use the same importer. `--filesystem ext4` is the default; optional
+`erofs` requires a mkfs.erofs supporting `--preserve-mtime`. The filesystem
+choice is explicit, never inferred from an image name or application files.
 The hidden path `/.__kuasar` is reserved for runtime file-operation helpers.
 
 The common runtime includes a statically linked `oci-launch` built from
@@ -430,14 +471,16 @@ Native process RPCs use image ENV/WORKDIR/USER defaults, with request environmen
 cwd and explicitly authenticated user overrides. SDK shell commands still need
 the requested shell in the image; a distroless image can use native argv instead.
 File RPCs use the reserved static helper, so they do not require image base64 or
-shell utilities. Legacy disk-only catalog entries retain the preceding command
-behavior and do not automatically start an OCI entrypoint.
+shell utilities. Catalog entries without OCI configuration must be reimported.
 
 After publishing a new immutable image ID, API-key-authenticated
 `POST /images/reload` with `{}` validates and adds it without draining or rebuilding
 any prepared VM. Existing IDs cannot be rebound or removed through this operation;
 use versioned IDs and retain artifacts referenced by running sandboxes. Validation
-runs outside the lifecycle lock; new file identities become visible before their
+runs outside the lifecycle lock. With preattached devices, cache copying, checksum
+verification and fsync finish before an ID is published; an import that exceeds
+the existing device capacity is rejected without rebuilding slots. New file
+identities become visible before their
 catalog entries. A running-parent fork inherits the saved OCI config, entrypoint
 PID, process state and writable overlay. It does not execute the entrypoint again.
 
@@ -523,7 +566,9 @@ persistent directory. This is a same-host, same-runtime-profile facility for
 read-only application disks; it does not change explicit live-parent fork.
 
 The adapter materializes each image once in a temporary builder sandbox. It
-mounts the image, runs the normal initialization, then asks
+mounts the image and optionally walks filesystem metadata with a zero file-read
+limit. It does **not** run ENTRYPOINT/CMD, an interpreter, or application code.
+It then asks
 `sandbox-snapshot-capture` to freeze the guest agent, pause the VM, save CPU,
 device and memory state, and take independently owned disk copies (reflinks
 where available). Files are sealed and synchronized before a manifest is
@@ -531,6 +576,9 @@ published and its directory synchronized. The builder is resumed and destroyed.
 A template is a set of files, not a parked VM or an image-specific VM pool.
 Cloud Hypervisor calls the memory file `memory-ranges`; it has the same role as
 a memory image. Template generation and host-cache warming are preparation costs.
+By default they run on the first request and are included in its latency.
+`E2B_EAGER_IMAGE_TEMPLATES=1` explicitly moves this work to service startup;
+report it separately. No application is started during either preparation mode.
 
 The existing single pool prepares network namespaces, CNI, endpoint identities,
 and VMM processes without selecting an application image. The
@@ -548,7 +596,10 @@ metadata (or stages it on a cache miss), and invokes
 `vm.restore` with `CopyOnWrite` and no full-memory prefault. Guest RAM is a
 private writable mapping of the immutable memory file. Restore, first guest
 faults, transport connection, entropy/network reset and final durable publication
-remain inside the measured create-to-command path. The required ForkControl
+remain inside the measured create-to-command path. OCI ENTRYPOINT/CMD executes
+after binding, before public lease publication; every fresh create uses the
+same ENV/WORKDIR/USER and startup semantics. Live-parent fork instead inherits
+the already-running processes and never restarts the entrypoint. The required ForkControl
 response checks guest responsiveness and its barrier token; an extra empty
 Check RPC is unnecessary. Event polling starts after identity reset. Network forwarding stays
 blocked until the restored guest has the slot's independent identity. Failure
@@ -563,6 +614,19 @@ can be imported through the normal catalog route; their first use includes
 preparation unless explicitly prepared beforehand. It does not allocate a
 second VM pool. Explicit forks inherit the running process/filesystem state
 through the original live-fork path, rather than restoring an older template.
+
+With file snapshots enabled, generic pool slots use `sandbox-pool-prepare`:
+CNI and a fresh network identity are prepared first, then an API-only VMM calls
+`vmm.prepare` to create KVM/vCPU resources. No temporary guest is booted, forked,
+or deleted, and no application disk is attached to this empty VMM. The durable
+slot configuration retains independent vsock/serial endpoints and MAC; network
+forwarding stays blocked through template restore and identity reset. This path
+requires the matching sandboxer with direct preparation support; failures are
+cleaned up rather than silently falling back to a live guest.
+
+Template capture and explicit running-parent forks keep their existing guest
+and device readiness barriers. Live-memory pools retain their existing device
+preparation path. Capacity and persistence rules are unchanged.
 
 Preparation metrics are in `STATE.snapshot-preparation.json`; refill and total
 replacement latency remain in `STATE.pool-events.jsonl`. Snapshot binding logs
@@ -643,3 +707,89 @@ from committed database rows before return, so other uncommitted in-memory
 records cannot leak into it. Full save remains available for reconciliation and
 multi-record changes. No transaction durability or guest identity barrier is
 removed, and the projection stays current for existing administration tools.
+
+### Empty-slot startup notification
+
+`KUASAR_POOL_BOOTSTRAP=1` opts the native sandboxer into the matching Cloud
+Hypervisor staging build's `--prepare-config` and `--prepare-ready-fd` interface.
+Leave it unset with older VMM binaries. A mismatched binary fails preparation;
+it does not silently fall back or publish a partially prepared slot.
+
+The native sandboxer first durably writes the generic slot configuration, then
+starts Cloud Hypervisor with that configuration and a one-shot inherited Unix
+socket. Cloud Hypervisor prepares the KVM VM and vCPUs without guest RAM and
+writes byte `1` only after preparation succeeds. Both ends close the notification
+FD; EOF, an invalid byte, or the existing ten-second deadline fails preparation.
+This replaces API-readiness polling plus the external `vmm.prepare` RPC. The
+existing network-cleanup join, template staging, and durable Ready publication
+remain inside measured refill work. It does not change running-parent fork or
+create a VM pool per image.
+
+### Restore immutable templates using the prepared slot identity
+
+`KUASAR_PREPARED_IDENTITY=1` requires a matching Cloud Hypervisor build advertising
+`prepared_identity_v1` in `vmm.ping`. It avoids creating a per-slot restore bundle:
+the VMM reads the sealed original template and applies the already prepared slot's
+NIC, vsock, serial and console identity to its private in-memory configuration.
+Only the matching NIC's snapshot MAC is changed. CPU state, disk paths and memory
+contents remain those of the template; guest RAM uses private file CoW.
+
+The slot's `generic-slot.json` is synchronized before the prepared slot is
+published. The selected
+`snapshot_template` key is committed with the private lease before restoration;
+the existing identity/network barriers still precede public Ready publication.
+Unsupported VMMs and incompatible templates fail preparation. This path requires
+plain private RAM, read-only template disks, and one matching NIC plus vsock. It
+does not change running-parent fork or allocate a separate VM pool for each image.
+
+The startup-notification experiment above is independent and remains disabled by
+default: measurements did not establish an advantage over the existing API path.
+
+### Native network preparation for generic slots
+
+Direct generic-slot preparation now requests `network_identity="fresh"` from
+`sandbox-pool-prepare`. The sandboxer changes the owned veth MAC through netlink
+before discovering the guest NIC configuration. The adapter requires the matching
+acknowledgement; older native binaries fail closed before a slot can be published.
+Running-parent fork retains its existing identity path.
+
+Ingress qdiscs, bidirectional redirect filters and the priority-1 drop barrier
+are installed directly through netlink, with kernel acknowledgements and exclusive
+creation. Removing the barrier preserves the priority-100 redirects. No `tc` or
+`nsenter + ip` subprocess is needed for this preparation path. Cleanup still joins
+before restoration; the old VM is reaped, stale connections are cleared, and the
+slot configuration and ownership records remain durable before publication.
+
+`CH_FORK_TIMING=1` additionally reports `VM_POOL_PREPARE` stages (validation,
+MSR profile, KVM VM, each vCPU and parking). These are nested within the host's
+`POOL_VMM_PHASE` and `POOL_PREPARE_PHASE` timers, not additional elapsed work.
+
+### Parallel preparation and optional background WAL checkpoints
+
+The API-based empty-slot path overlaps host VMM startup with writing and syncing
+`generic-slot.json` and its directory. Both operations are joined, including on
+error, before returning or cleaning up the slot. This starts no guest and exposes
+no Ready slot before durability succeeds. The optional startup-notification path
+still persists the file first because that VMM reads it during startup.
+`persist_config` overlaps `spawn_monitor`/`api_prepare`; do not sum their durations.
+
+`E2B_SQLITE_CHECKPOINT=background` opts WAL deployments into an independent
+PASSIVE checkpointer. A non-inherited owner lock retains single-adapter ownership
+while SQLite NORMAL locking permits the checkpoint connection. Every commit still uses `synchronous=EXTRA` and synchronizes
+the WAL before acknowledgement. Only checkpoint/reclamation work is asynchronous;
+this is not asynchronous persistence. PERSIST mode and the default WAL mode retain
+the existing behavior. The worker wakes after 64 changed commits or a 250 ms idle
+interval. At 1024 uncheckpointed commits, writers wait for progress and fail after
+30 seconds if progress is impossible. Worker errors fail subsequent writes. This
+bounds pending commit count, not record size; large individual records still need
+application-level limits. `DurableState.close()` joins the worker before closing the writer; process
+termination can leave WAL recovery work, as before.
+
+`wal_checkpoint` timing events report elapsed work and log/checkpointed frame
+counts separately. Report their cost alongside preparation/refill latency: work
+performed by the worker must not be presented as eliminated work. Readiness still
+requires durable ownership, durable slot configuration and the guest/network
+identity barriers. WAL/SHM sidecars remain part of crash recovery.
+
+Background checkpointing remains opt-in: the measured comparison did not establish
+a consistent advantage over parallel preparation with automatic checkpointing.

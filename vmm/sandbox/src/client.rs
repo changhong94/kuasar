@@ -80,6 +80,9 @@ pub(crate) async fn new_snapshot_sandbox_client(address: &str) -> Result<Sandbox
                 connect_to_socket(address).await
             };
             match result {
+                // The VMM fences new host connections until the guest has
+                // consumed TRANSPORT_RESET. Identity errors must surface rather
+                // than being hidden by a Check/reconnect loop.
                 Ok(fd) => return SandboxServiceClient::new(Client::new(fd)),
                 Err(error) => tracing::info!(%error, elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
                     "snapshot agent connect retry"),
@@ -509,6 +512,10 @@ mod tests {
 
     #[tokio::test]
     async fn fork_reconnect_replaces_a_reset_connection() {
+        reconnect_replaces_a_reset_connection().await;
+    }
+
+    async fn reconnect_replaces_a_reset_connection() {
         use std::{sync::Arc, time::Duration};
 
         use vmm_common::api::{
@@ -545,7 +552,9 @@ mod tests {
         });
         let client = tokio::time::timeout(
             Duration::from_secs(3),
-            super::reconnect_checked_sandbox_client(&address),
+            async {
+                super::reconnect_checked_sandbox_client(&address).await
+            },
         )
         .await
         .unwrap()

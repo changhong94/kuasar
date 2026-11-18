@@ -155,6 +155,12 @@ pub trait VM: Serialize + Sync + Send {
     async fn launch_checkpoint_controller(&mut self, _netns: &str) -> Result<()> {
         Err(anyhow!("cold checkpoint recovery is unsupported by this backend").into())
     }
+    /// Prepare an empty KVM/vCPU set for a later private-CoW snapshot restore.
+    /// This must not boot a guest or inherit a running parent's memory.
+    async fn prepare_pool_vm(&mut self, _config: serde_json::Value) -> Result<u32> {
+        Err(anyhow!("direct pool preparation is unsupported by this backend").into())
+
+    }
     async fn fork_from(&mut self, _parent: &mut Self) -> Result<u32>
     where
         Self: Sized,

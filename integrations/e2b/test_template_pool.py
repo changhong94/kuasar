@@ -179,3 +179,63 @@ class PoolTests(unittest.TestCase):
             self.backend.get_public(sid)
         self.pool.drain()
         self.assertEqual(self.backend.records, {})
+
+    def test_device_preparation_overlaps_network_but_publication_waits(self):
+        original = self.backend._create_live
+        network = concurrent.futures.Future()
+        device_done = threading.Event()
+        final = []
+        def create(*args, **kwargs):
+            sid = original(*args, **kwargs)
+            self.backend.records[sid]['network_state'] = 'pending'
+            self.backend.jobs[sid] = network
+            return sid
+        self.backend._create_live = create
+        self.backend.prepare_slot_device = lambda sid: device_done.set()
+        self.backend.prepare_slot = lambda sid, **kw: final.append(kw)
+        with concurrent.futures.ThreadPoolExecutor() as worker:
+            starting = worker.submit(self.start, 1)
+            try:
+                self.assertTrue(device_done.wait(2))
+                self.assertFalse(starting.done())
+                self.assertEqual(final, [])
+                self.assertEqual(self.backend.records['1']['pool_state'], 'preparing')
+                self.backend.records['1']['network_state'] = 'ready'
+            finally:
+                network.set_result(None)
+            starting.result(2)
+        self.assertEqual(final, [{'device_prepared': True}])
+        self.assertEqual(self.pool.status()['ready'], 1)
+
+    def test_failed_device_preparation_never_publishes_slot(self):
+        def fail(sid):
+            raise RuntimeError('device failure')
+        self.backend.prepare_slot_device = fail
+        with self.assertRaisesRegex(RuntimeError, 'device failure'):
+            self.start(1)
+        self.assertEqual(self.backend.records, {})
+
+    def test_lease_starts_delay_but_never_overcommits_before_retirement(self):
+        self.pool = TemplatePool(self.backend, 1, refill_delay=60)
+        self.backend.template_pool = self.pool
+        sid = self.backend.create({})['sandboxID']
+        self.assertIsNotNone(self.pool.due)
+        with self.pool.condition:
+            self.pool.due = time.monotonic()-1
+            self.pool.condition.notify_all()
+        time.sleep(.02)
+        self.assertEqual(self.backend.created, 1)
+        self.assertEqual(self.pool.status()['owned'], 1)
+        self.backend.destroy(sid)
+        with self.pool.condition:
+            self.assertTrue(self.pool.condition.wait_for(
+                lambda: self.pool.status()['ready'] == 1, timeout=2))
+        self.assertEqual(self.backend.created, 2)
+        self.assertEqual(self.pool.status()['owned'], 1)
+
+    def test_template_identity_commits_before_private_lease_returns(self):
+        self.start(1)
+        sid=self.pool.lease({},private=True,binding={'template_id':'base','snapshot_template':'image-sealed'})
+        self.assertEqual(self.backend.committed[sid]['snapshot_template'],'image-sealed')
+        self.assertEqual(self.backend.committed[sid]['pool_state'],'binding')
+        with self.assertRaises(APIError):self.backend.get_public(sid)

@@ -675,7 +675,8 @@ NIC, vsock, serial and console identity to its private in-memory configuration.
 Only the matching NIC's snapshot MAC is changed. CPU state, disk paths and memory
 contents remain those of the template; guest RAM uses private file CoW.
 
-The slot's `generic-slot.json` is synchronized before KVM preparation. The selected
+The slot's `generic-slot.json` is synchronized before the prepared slot is
+published. The selected
 `snapshot_template` key is committed with the private lease before restoration;
 the existing identity/network barriers still precede public Ready publication.
 Unsupported VMMs and incompatible templates fail preparation. This path requires
@@ -703,3 +704,12 @@ slot configuration and ownership records remain durable before publication.
 `CH_FORK_TIMING=1` additionally reports `VM_POOL_PREPARE` stages (validation,
 MSR profile, KVM VM, each vCPU and parking). These are nested within the host's
 `POOL_VMM_PHASE` and `POOL_PREPARE_PHASE` timers, not additional elapsed work.
+
+### Parallel preparation and optional background WAL checkpoints
+
+The API-based empty-slot path overlaps host VMM startup with writing and syncing
+`generic-slot.json` and its directory. Both operations are joined, including on
+error, before returning or cleaning up the slot. This starts no guest and exposes
+no Ready slot before durability succeeds. The optional startup-notification path
+still persists the file first because that VMM reads it during startup.
+`persist_config` overlaps `spawn_monitor`/`api_prepare`; do not sum their durations.

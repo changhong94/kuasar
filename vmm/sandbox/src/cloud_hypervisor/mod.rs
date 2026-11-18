@@ -242,6 +242,49 @@ impl CloudHypervisorVM {
     }
 }
 
+// Always join both operations, including on failure: destruction must never
+// race an outstanding disk write or a child process that has not been registered.
+async fn join_prepared_slot(
+    durable: impl std::future::Future<Output = Result<()>>,
+    launch: impl std::future::Future<Output = Result<u32>>,
+) -> Result<u32> {
+    let (durability, process) = tokio::join!(durable, launch);
+    durability?;
+    process
+}
+
+#[cfg(test)]
+mod prepared_slot_join_tests {
+    use super::*;
+    #[tokio::test]
+    async fn failures_join_the_other_barrier_before_cleanup() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        for fail_durable in [true, false] {
+            let disk_done = AtomicBool::new(false);
+            let child_done = AtomicBool::new(false);
+            let durable = async {
+                if fail_durable {
+                    return Err(anyhow!("injected disk failure").into());
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                disk_done.store(true, Ordering::SeqCst);
+                Ok(())
+            };
+            let launch = async {
+                if !fail_durable {
+                    return Err(anyhow!("injected launch failure").into());
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                child_done.store(true, Ordering::SeqCst);
+                Ok(123)
+            };
+            assert!(join_prepared_slot(durable, launch).await.is_err());
+            assert_eq!(disk_done.load(Ordering::SeqCst), !fail_durable);
+            assert_eq!(child_done.load(Ordering::SeqCst), fail_durable);
+        }
+    }
+}
+
 #[async_trait]
 impl VM for CloudHypervisorVM {
     fn live_fork_profile(&self) -> bool {
@@ -260,13 +303,6 @@ impl VM for CloudHypervisorVM {
             "guest_agent": self.fork_cid.is_some(), "cid": self.fork_cid, "vsock_socket": self.vsock_path()})
     }
     async fn prepare_pool_vm(&mut self, mut config: serde_json::Value) -> Result<u32> {
-        let mut previous = std::time::Instant::now();
-        let id = self.id.clone();
-        let mut mark = |phase: &str| {
-            let now = std::time::Instant::now();
-            tracing::info!(sandbox_id = %id, phase, elapsed_us = (now-previous).as_micros() as u64, "POOL_VMM_PHASE");
-            previous = now;
-        };
         if !self.live_fork || self.fork_cid.is_none() || self.pids.vmm_pid.is_some() {
             return Err(
                 anyhow!("direct preparation requires an unstarted live-fork agent slot").into(),
@@ -287,94 +323,121 @@ impl VM for CloudHypervisorVM {
         config["vsock"]["socket"] = serde_json::json!(self.vsock_path());
         config["serial"] = serde_json::json!({"mode":"Socket", "socket":self.fork_serial_path()});
         config["console"] = serde_json::json!({"mode":"Off"});
-        // Persist the exact transport/profile binding before publication. This
-        // config has no per-application image and does not instantiate RAM.
+        // This empty VMM cannot run a guest. Its host startup may overlap
+        // configuration durability, but both barriers must finish before return.
         let path = Path::new(&self.base_dir).join("generic-slot.json");
-        tokio::fs::write(
-            &path,
-            serde_json::to_vec(&config).map_err(anyhow::Error::from)?,
-        )
-        .await?;
-        std::fs::File::open(&path)?.sync_all()?;
-        std::fs::File::open(&self.base_dir)?.sync_all()?;
-        mark("persist_config");
-        let bootstrap = std::env::var("KUASAR_POOL_BOOTSTRAP").as_deref() == Ok("1");
-        let (readiness, notifier) = if bootstrap {
-            let (reader, writer) = std::os::unix::net::UnixStream::pair()?;
-            reader.set_nonblocking(true)?;
-            (
-                Some(tokio::net::UnixStream::from_std(reader)?),
-                Some(writer),
-            )
-        } else {
-            (None, None)
+        let persist_path = path.clone();
+        let directory = self.base_dir.clone();
+        let bytes = serde_json::to_vec(&config).map_err(anyhow::Error::from)?;
+        let persist_id = self.id.clone();
+        let persist = async move {
+            let started = std::time::Instant::now();
+            tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+                std::fs::write(&persist_path, bytes)?;
+                std::fs::File::open(&persist_path)?.sync_all()?;
+                std::fs::File::open(directory)?.sync_all()?;
+                Ok(())
+            })
+            .await
+            .map_err(|e| anyhow!("configuration persistence task failed: {e}"))??;
+            tracing::info!(sandbox_id = %persist_id, phase = "persist_config",
+                elapsed_us = started.elapsed().as_micros() as u64, "POOL_VMM_PHASE");
+            Ok(())
         };
-        let mut command = tokio::process::Command::new(&self.config.path);
-        command.args(["--api-socket", &self.config.api_socket, "--enable-fork"]);
-        set_cmd_netns(&mut command, self.netns.clone())?;
-        if let Some(writer) = notifier.as_ref() {
-            let fd = writer.as_raw_fd();
-            command
-                .arg("--prepare-config")
-                .arg(&path)
-                .arg("--prepare-ready-fd")
-                .arg(fd.to_string());
-            // SAFETY: The writer remains alive through spawn. The callback only
-            // calls async-signal-safe fcntl and never allocates or acquires locks.
-            unsafe {
-                command.pre_exec(move || {
-                    // Only the notification socket is inherited by exec.
-                    // The parent retains CLOEXEC and closes its copy after spawn.
-                    if nix::libc::fcntl(fd, nix::libc::F_SETFD, 0) < 0 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                    Ok(())
-                });
+        let bootstrap = std::env::var("KUASAR_POOL_BOOTSTRAP").as_deref() == Ok("1");
+        let launch = async {
+            let mut previous = std::time::Instant::now();
+            let id = self.id.clone();
+            let mut mark = |phase: &str| {
+                let now = std::time::Instant::now();
+                tracing::info!(sandbox_id = %id, phase, elapsed_us = (now-previous).as_micros() as u64, "POOL_VMM_PHASE");
+                previous = now;
+            };
+            let (readiness, notifier) = if bootstrap {
+                let (reader, writer) = std::os::unix::net::UnixStream::pair()?;
+                reader.set_nonblocking(true)?;
+                (
+                    Some(tokio::net::UnixStream::from_std(reader)?),
+                    Some(writer),
+                )
+            } else {
+                (None, None)
+            };
+            let mut command = tokio::process::Command::new(&self.config.path);
+            command.args(["--api-socket", &self.config.api_socket, "--enable-fork"]);
+            set_cmd_netns(&mut command, self.netns.clone())?;
+            if let Some(writer) = notifier.as_ref() {
+                let fd = writer.as_raw_fd();
+                command
+                    .arg("--prepare-config")
+                    .arg(&path)
+                    .arg("--prepare-ready-fd")
+                    .arg(fd.to_string());
+                // SAFETY: The writer remains alive through spawn. The callback only
+                // calls async-signal-safe fcntl and never allocates or acquires locks.
+                unsafe {
+                    command.pre_exec(move || {
+                        // Only the notification socket is inherited by exec.
+                        // The parent retains CLOEXEC and closes its copy after spawn.
+                        if nix::libc::fcntl(fd, nix::libc::F_SETFD, 0) < 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        Ok(())
+                    });
+                }
             }
-        }
-        command.stdout(Stdio::piped()).stderr(Stdio::piped());
-        let child = command.spawn()?;
-        drop(notifier);
-        let pid = child
-            .id()
-            .ok_or_else(|| anyhow!("missing prepared VMM PID"))?;
-        self.pids.vmm_pid = Some(pid);
-        spawn_wait(
-            child,
-            format!("prepared cloud-hypervisor {}", self.id),
-            None,
-            None,
-        );
-        self.monitor_pidfd(pid).await?;
-        mark("spawn_monitor");
-        if let Some(mut ready) = readiness {
-            use tokio::io::AsyncReadExt;
-            let mut signal = [0u8; 1];
-            tokio::time::timeout(Duration::from_secs(10), ready.read_exact(&mut signal))
-                .await
-                .map_err(|_| anyhow!("prepared VMM readiness timeout"))??;
-            if signal != [1] {
-                return Err(anyhow!("invalid prepared VMM readiness signal").into());
-            }
-            mark("bootstrap_ready");
-        } else {
-            let deadline = Instant::now() + Duration::from_secs(10);
-            loop {
-                if live_fork::request(&self.config.api_socket, "GET", "vmm.ping", None)
+            command.stdout(Stdio::piped()).stderr(Stdio::piped());
+            let child = command.spawn()?;
+            drop(notifier);
+            let pid = child
+                .id()
+                .ok_or_else(|| anyhow!("missing prepared VMM PID"))?;
+            self.pids.vmm_pid = Some(pid);
+            spawn_wait(
+                child,
+                format!("prepared cloud-hypervisor {}", self.id),
+                None,
+                None,
+            );
+            self.monitor_pidfd(pid).await?;
+            mark("spawn_monitor");
+            if let Some(mut ready) = readiness {
+                use tokio::io::AsyncReadExt;
+                let mut signal = [0u8; 1];
+                tokio::time::timeout(Duration::from_secs(10), ready.read_exact(&mut signal))
                     .await
-                    .is_ok()
-                {
-                    break;
+                    .map_err(|_| anyhow!("prepared VMM readiness timeout"))??;
+                if signal != [1] {
+                    return Err(anyhow!("invalid prepared VMM readiness signal").into());
                 }
-                if Instant::now() >= deadline {
-                    return Err(anyhow!("prepared VMM API startup timeout").into());
+                mark("bootstrap_ready");
+            } else {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                loop {
+                    if live_fork::request(&self.config.api_socket, "GET", "vmm.ping", None)
+                        .await
+                        .is_ok()
+                    {
+                        break;
+                    }
+                    if Instant::now() >= deadline {
+                        return Err(anyhow!("prepared VMM API startup timeout").into());
+                    }
+                    tokio::time::sleep(Duration::from_millis(1)).await;
                 }
-                tokio::time::sleep(Duration::from_millis(1)).await;
+                live_fork::request(&self.config.api_socket, "PUT", "vmm.prepare", Some(config))
+                    .await?;
+                mark("api_prepare");
             }
-            live_fork::request(&self.config.api_socket, "PUT", "vmm.prepare", Some(config)).await?;
-            mark("api_prepare");
+            Ok(pid)
+        };
+        if bootstrap {
+            // Startup notification consumes the file, so retain its ordering.
+            persist.await?;
+            launch.await
+        } else {
+            join_prepared_slot(persist, launch).await
         }
-        Ok(pid)
     }
     async fn fork_from(&mut self, parent: &mut Self) -> Result<u32> {
         self.fork_live_vm(parent).await

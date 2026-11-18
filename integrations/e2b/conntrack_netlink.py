@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Delete only conntrack tuples containing one owned IPv4 address.
 
-Use filtered kernel dumps and exact tuple+ID deletions, never a host table flush.
-Requires CTA_FILTER support; all malformed/interrupted/error replies fail closed.
+Use one namespace dump and exact tuple+ID deletions, never a host table flush.
+All malformed/interrupted/error replies fail closed. Unrelated tuples are ignored.
 """
 import errno
 import ipaddress
@@ -102,12 +102,22 @@ class Conntrack:
     def delete_ip(self, address):
         packed = ipaddress.IPv4Address(address).packed
         targets = set()
-        for side, flag in [(1, 1), (2, 2)]:
-            tuple_filter = attr(0x8001, attr(0x8001, attr(side, packed)))
-            filter_flags = attr(0x8019, attr(1, struct.pack('=I', flag)))
-            payload = bytes([socket.AF_INET, 0, 0, 0])+tuple_filter+filter_flags
-            for entry in self.request(0x101, 0x301, payload):
-                targets.add(deletion_payload(entry, packed, side))
+        # The kernel's src/dst filters still walk every conntrack hash bucket.
+        # One dump avoids doing that twice. Inspect both original addresses,
+        # but retain only this slot's tuples and never log unrelated entries.
+        # Finish the entire dump before deleting anything: an interrupted dump
+        # must not be mistaken for complete isolation of the old generation.
+        for entry in self.request(0x101, 0x301, bytes([socket.AF_INET, 0, 0, 0])):
+            if len(entry) < 4 or entry[0] != socket.AF_INET:
+                raise ValueError('unexpected conntrack address family')
+            addresses = attributes(attributes(attributes(entry[4:])[1][1])[1][1])
+            for side in (1, 2):
+                value = addresses[side][1]
+                if len(value) != 4:
+                    raise ValueError('invalid conntrack IPv4 address')
+                if value == packed:
+                    targets.add(deletion_payload(entry, packed, side))
+                    break
         for payload in targets:
             try:
                 list(self.request(0x102, 5, payload))

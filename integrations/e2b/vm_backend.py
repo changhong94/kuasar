@@ -2,6 +2,7 @@
 """Default E2B backend: live Kuasar VMs with independently progressing CNI."""
 import base64
 import concurrent.futures
+from contextlib import nullcontext
 import datetime
 import json
 import os
@@ -225,6 +226,9 @@ class VMBackend(Backend):
                         raise APIError(409, 'Source network is not ready for another fork')
             source = parent or self.args.source
             sid = 'e2b-'+secrets.token_hex(12)
+            direct = _pool_owned and getattr(self, 'direct_pool_prepare', False)
+            networks = getattr(self, 'network_pool', None) if direct else None
+            reservation = None
             with self.lock:
                 self.operations[sid] = threading.RLock()
                 self.records[sid] = {'backend': 'vm', 'status': 'creating', 'network_state': 'pending',
@@ -241,7 +245,13 @@ class VMBackend(Backend):
                 elif _private:
                     self.records[sid]['pool_state'] = 'preparing'
                 try:
-                    self.save()
+                    # Creation and idle-network ownership transfer are a single
+                    # durable transaction. No external side effect precedes it.
+                    # Cold slots without an idle network keep the normal commit.
+                    if networks:
+                        reservation = networks.reserve(sid)
+                    if reservation is None:
+                        self.save()
                 except Exception:
                     self.records[sid]['status'] = 'deleting'
                     try:
@@ -254,34 +264,35 @@ class VMBackend(Backend):
                 try:
                     trace_timing('create_record', started_ns, sid=sid)
                     ns_start = time.perf_counter_ns()
-                    direct = _pool_owned and getattr(self, 'direct_pool_prepare', False)
-                    networks = getattr(self, 'network_pool', None) if direct else None
-                    ns = networks.claim(sid) if networks else None
-                    reused = ns is not None
-                    if ns is None:
-                        ns = self.namespace(sid)
-                        if networks:
-                            networks.run(['sysctl', '-qw', 'net.ipv6.conf.all.disable_ipv6=1',
-                                          'net.ipv6.conf.default.disable_ipv6=1',
-                                          'net.ipv4.conf.default.arp_notify=1'], self.get(sid))
-                    trace_timing('namespace', ns_start, sid=sid, reused=reused)
-                    if direct:
-                        # The empty VMM has no guest agent to configure. Finish
-                        # CNI before native network discovery; native preparation
-                        # keeps forwarding blocked until snapshot identity reset.
-                        if not reused:
-                            with self.lock:
-                                self.get(sid).update(cni_owner=sid, network_slot='net-'+secrets.token_hex(12), network_generation=1)
-                                self.save()
-                            self.cni_call(sid, 'ADD')
+                    # Only a private RAM-less VMM may overlap old-flow cleanup.
+                    # Context exit joins cleanup before Running/Ready persistence,
+                    # and before the exception path can destroy this generation.
+                    with networks.claim_preparing(sid, reservation) if networks else nullcontext(None) as ns:
+                        reused = ns is not None
+                        if ns is None:
+                            ns = self.namespace(sid)
                             if networks:
-                                networks.capture_routes(sid)
-                        ip = self.address(self.get(sid))
-                        if not ip:
-                            raise RuntimeError('prepared pool namespace has no IPv4 address')
-                        info = self.admin('sandbox-pool-prepare', source_id=source, sandbox_id=sid, netns=ns)
-                    else:
-                        info = self.admin('sandbox-fork', source_id=source, sandbox_id=sid, netns=ns, defer_network=True)
+                                networks.run(['sysctl', '-qw', 'net.ipv6.conf.all.disable_ipv6=1',
+                                              'net.ipv6.conf.default.disable_ipv6=1',
+                                              'net.ipv4.conf.default.arp_notify=1'], self.get(sid))
+                        trace_timing('namespace', ns_start, sid=sid, reused=reused)
+                        if direct:
+                            # The empty VMM has no guest agent to configure. Finish
+                            # CNI before native network discovery; native preparation
+                            # keeps forwarding blocked until snapshot identity reset.
+                            if not reused:
+                                with self.lock:
+                                    self.get(sid).update(cni_owner=sid, network_slot='net-'+secrets.token_hex(12), network_generation=1)
+                                    self.save()
+                                self.cni_call(sid, 'ADD')
+                                if networks:
+                                    networks.capture_routes(sid)
+                            ip = self.address(self.get(sid))
+                            if not ip:
+                                raise RuntimeError('prepared pool namespace has no IPv4 address')
+                            info = self.admin('sandbox-pool-prepare', source_id=source, sandbox_id=sid, netns=ns)
+                        else:
+                            info = self.admin('sandbox-fork', source_id=source, sandbox_id=sid, netns=ns, defer_network=True)
                     completion_ns = time.perf_counter_ns()
                     with self.lock:
                         trace_timing('completion_lock_wait', completion_ns, sid=sid)

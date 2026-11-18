@@ -105,3 +105,62 @@ class NetworkPoolTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError,'cleanup failed'):
             self.pool.parallel([fail,complete])
         self.assertTrue(finished.is_set())
+
+    def test_private_preparation_overlaps_cleanup_but_exit_joins_it(self):
+        b=self.backend;b.records['net-owned']=dict(self.record,network_only=True,status='network_idle')
+        b.records['new']=dict(token='fresh',pool_state='preparing')
+        started=threading.Event();release=threading.Event();finished=threading.Event()
+        def cleanup(_):
+            started.set()
+            if not release.wait(2):raise RuntimeError('test did not release cleanup')
+            finished.set()
+        with patch.object(self.pool,'owned'),patch.object(self.pool,'run'),patch.object(self.pool,'clear_host_conntrack',side_effect=cleanup):
+            with self.pool.claim_preparing('new') as ns:
+                self.assertEqual(ns,'/owned/ns')
+                self.assertTrue(started.wait(1))
+                self.assertFalse(finished.is_set())
+                self.assertEqual(b.records['new']['pool_state'],'preparing')
+                release.set()
+            self.assertTrue(finished.is_set())
+
+    def test_preparation_failure_joins_cleanup_before_destroy(self):
+        b=self.backend;b.records['net-owned']=dict(self.record,network_only=True,status='network_idle')
+        b.records['new']=dict(token='fresh',pool_state='preparing')
+        finished=threading.Event()
+        def cleanup(_):
+            import time
+            time.sleep(.02)
+            finished.set()
+        with patch.object(self.pool,'owned'),patch.object(self.pool,'run'),patch.object(self.pool,'clear_host_conntrack',side_effect=cleanup):
+            with self.assertRaisesRegex(RuntimeError,'KVM failed'):
+                with self.pool.claim_preparing('new'):
+                    raise RuntimeError('KVM failed')
+            self.assertTrue(finished.is_set())
+            self.assertEqual(b.records['new']['pool_state'],'preparing')
+
+    def test_cleanup_failure_prevents_scope_success(self):
+        b=self.backend;b.records['net-owned']=dict(self.record,network_only=True,status='network_idle')
+        b.records['new']=dict(token='fresh',pool_state='preparing')
+        published=False
+        with patch.object(self.pool,'owned'),patch.object(self.pool,'run'),patch.object(self.pool,'clear_host_conntrack',side_effect=RuntimeError('cleanup failed')):
+            with self.assertRaisesRegex(RuntimeError,'cleanup failed'):
+                with self.pool.claim_preparing('new'):
+                    pass
+                published=True
+        self.assertFalse(published)
+
+    def test_reservation_commits_creation_and_transfer_once_before_side_effects(self):
+        b=self.backend;b.records['net-owned']=dict(self.record,network_only=True,status='network_idle')
+        b.records['new']=dict(token='fresh',pool_state='preparing',status='creating')
+        with patch.object(b,'save',wraps=b.save) as commit,patch.object(self.pool,'owned'),patch.object(self.pool,'run') as run,patch.object(self.pool,'clear_host_conntrack') as clear:
+            reservation=self.pool.reserve('new')
+            self.assertEqual(commit.call_count,1)
+            run.assert_not_called();clear.assert_not_called()
+            self.assertNotIn('net-owned',b.committed)
+            self.assertEqual(b.committed['new']['network_generation'],5)
+            self.assertEqual(b.committed['new']['token'],'fresh')
+            with self.pool.claim_preparing('new',reservation):
+                pass
+            self.assertEqual(commit.call_count,1)
+            self.assertEqual(run.call_count,1)
+            self.assertEqual(clear.call_count,1)

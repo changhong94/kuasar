@@ -3,6 +3,7 @@
 import ipaddress
 import errno
 import concurrent.futures
+from contextlib import contextmanager
 import json
 import os
 import secrets
@@ -80,7 +81,8 @@ class NetworkPool:
             b.get(sid)['network_routes'] = saved
             b.save()
 
-    def claim(self, sid):
+    def reserve(self, sid):
+        """Atomically commit the new record and transfer an idle namespace."""
         b = self.backend
         started = time.perf_counter_ns()
         with b.lock:
@@ -102,16 +104,39 @@ class NetworkPool:
             copy = dict(r)
         from server import trace_timing
         trace_timing('network_claim_commit', started, sid=sid)
+        return copy
+
+    def claim(self, sid):
+        with self.claim_preparing(sid) as namespace:
+            return namespace
+
+    @contextmanager
+    def claim_preparing(self, sid, reservation=None):
+        """Allow only private, RAM-less KVM preparation during old-flow cleanup.
+
+        The caller must leave this scope before publishing or restoring a guest.
+        Failure joins cleanup before the caller destroys/reassigns the namespace.
+        """
+        copy = reservation if reservation is not None else self.reserve(sid)
+        if copy is None:
+            yield None
+            return
         started = time.perf_counter_ns()
         mac = bytearray(secrets.token_bytes(6)); mac[0] = (mac[0] & 0xfe) | 0x02
-        # Drop entries created by late packets during the idle interval too.
         address = ':'.join(f'{x:02x}' for x in mac)
-        # No new VMM exists yet. Finish both identity and old-state cleanup
-        # before the caller creates one or publishes the slot.
-        self.parallel([lambda: self.clear_host_conntrack(copy),
-                       lambda: self.run(['ip', 'link', 'set', 'dev', 'eth0', 'address', address], copy)])
-        trace_timing('network_claim_reset', started, sid=sid)
-        return copy['netns']
+        from server import trace_timing
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            cleanup = executor.submit(self.clear_host_conntrack, copy)
+            try:
+                self.run(['ip', 'link', 'set', 'dev', 'eth0', 'address', address], copy)
+                trace_timing('network_claim_identity', started, sid=sid)
+                yield copy['netns']
+            finally:
+                wait = time.perf_counter_ns()
+                try:
+                    cleanup.result()
+                finally:
+                    trace_timing('network_claim_cleanup_join', wait, sid=sid)
 
     def reset(self, r):
         self.owned(r)
@@ -147,8 +172,8 @@ class NetworkPool:
             delete_ip(r['ip'])
             return
         except OSError as error:
-            # Old kernels may reject tuple dump filters; no delete has run in
-            # that case. Preserve the existing scoped CLI path for those hosts.
+            # Unsupported netlink operations retain the scoped CLI path.
+            # Neither implementation can issue a shared-host table flush.
             if error.errno not in (errno.EOPNOTSUPP, errno.EINVAL):
                 raise
         finally:

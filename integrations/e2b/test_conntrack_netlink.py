@@ -26,11 +26,11 @@ class ConntrackTests(unittest.TestCase):
         client=Conntrack();calls=[]
         def request(kind, flags, payload):
             calls.append(kind)
-            if len(calls)==2:raise OSError('dump interrupted')
             yield entry('10.0.0.2','10.0.0.3')
+            raise OSError('dump interrupted')
         client.request=request
         with self.assertRaises(OSError):client.delete_ip('10.0.0.2')
-        self.assertEqual(calls,[0x101,0x101])
+        self.assertEqual(calls,[0x101])
 
     def test_empty_dump_never_issues_unscoped_delete(self):
         client=Conntrack();calls=[]
@@ -39,4 +39,18 @@ class ConntrackTests(unittest.TestCase):
             return iter([])
         client.request=request
         self.assertEqual(client.delete_ip('10.0.0.2'),0)
-        self.assertEqual(calls,[0x101,0x101])
+        self.assertEqual(calls,[0x101])
+
+    def test_one_dump_filters_both_sides_and_preserves_unrelated(self):
+        client = Conntrack(); calls = []
+        source = entry('10.0.0.2', '10.0.0.3', 1)
+        dest = entry('10.0.0.3', '10.0.0.2', 2)
+        both = entry('10.0.0.2', '10.0.0.2', 3)
+        unrelated = entry('10.0.0.3', '10.0.0.4', 4)
+        def request(kind, flags, payload):
+            calls.append((kind, payload))
+            return iter([source, dest, both, unrelated] if kind == 0x101 else [])
+        client.request = request
+        self.assertEqual(client.delete_ip('10.0.0.2'), 3)
+        self.assertEqual(sum(k == 0x101 for k, _ in calls), 1)
+        self.assertEqual({p for k, p in calls if k == 0x102}, {source, dest, both})

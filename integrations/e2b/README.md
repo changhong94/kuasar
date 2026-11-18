@@ -713,3 +713,24 @@ error, before returning or cleaning up the slot. This starts no guest and expose
 no Ready slot before durability succeeds. The optional startup-notification path
 still persists the file first because that VMM reads it during startup.
 `persist_config` overlaps `spawn_monitor`/`api_prepare`; do not sum their durations.
+
+`E2B_SQLITE_CHECKPOINT=background` opts WAL deployments into an independent
+PASSIVE checkpointer. A non-inherited owner lock retains single-adapter ownership
+while SQLite NORMAL locking permits the checkpoint connection. Every commit still uses `synchronous=EXTRA` and synchronizes
+the WAL before acknowledgement. Only checkpoint/reclamation work is asynchronous;
+this is not asynchronous persistence. PERSIST mode and the default WAL mode retain
+the existing behavior. The worker wakes after 64 changed commits or a 250 ms idle
+interval. At 1024 uncheckpointed commits, writers wait for progress and fail after
+30 seconds if progress is impossible. Worker errors fail subsequent writes. This
+bounds pending commit count, not record size; large individual records still need
+application-level limits. `DurableState.close()` joins the worker before closing the writer; process
+termination can leave WAL recovery work, as before.
+
+`wal_checkpoint` timing events report elapsed work and log/checkpointed frame
+counts separately. Report their cost alongside preparation/refill latency: work
+performed by the worker must not be presented as eliminated work. Readiness still
+requires durable ownership, durable slot configuration and the guest/network
+identity barriers. WAL/SHM sidecars remain part of crash recovery.
+
+Background checkpointing remains opt-in: the measured comparison did not establish
+a consistent advantage over parallel preparation with automatic checkpointing.

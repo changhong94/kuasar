@@ -232,3 +232,61 @@ class ExternalWALCrashTests(unittest.TestCase):
                 cases.test_kill_uncommitted_transaction_rolls_back()
                 cases.test_failed_commit_does_not_publish_json()
                 cases.test_partial_commit_survives_kill_before_projection()
+
+
+class BackgroundWALTests(unittest.TestCase):
+    def test_background_preserves_crash_durability(self):
+        from unittest.mock import patch
+        with patch.dict(os.environ, {'E2B_SQLITE_CHECKPOINT': 'background'}):
+            WALDurableStateTests().test_wal_keeps_extra_and_recovers_committed_and_uncommitted_crashes()
+            ExternalWALCrashTests().test_external_wal_crash_recovery()
+
+    def test_checkpoint_debt_blocks_until_reader_releases_and_thread_closes(self):
+        import sqlite3
+        import threading
+        import time
+        from unittest.mock import patch
+        with patch.dict(os.environ, {'E2B_SQLITE_JOURNAL':'WAL', 'E2B_SQLITE_CHECKPOINT':'background'}):
+            with tempfile.TemporaryDirectory() as d:
+                p=Path(d)/'state';store=DurableState(p)
+                self.assertEqual(store.db.execute('PRAGMA wal_autocheckpoint').fetchone()[0],0)
+                self.assertEqual(store.db.execute('PRAGMA synchronous').fetchone()[0],3)
+                store.save({'generation':0})
+                reader=sqlite3.connect(store.db_path, isolation_level=None)
+                reader.execute('BEGIN');reader.execute('SELECT * FROM state_records').fetchall()
+                cp=store.checkpointer;cp.MAX_PENDING=2;cp.WAKE_COMMITS=1
+                store.save({'generation':1})
+                end=time.monotonic()+5
+                while cp.last_result is None:
+                    self.assertLess(time.monotonic(),end);time.sleep(.01)
+                passed=threading.Event();errors=[]
+                def waiter():
+                    try:cp.before_commit();passed.set()
+                    except Exception as e:errors.append(e)
+                t=threading.Thread(target=waiter);t.start()
+                self.assertFalse(passed.wait(.1))
+                reader.execute('COMMIT');reader.close();cp.wake.set()
+                t.join(5);self.assertFalse(t.is_alive());self.assertFalse(errors);self.assertTrue(passed.is_set())
+                store.save({'generation':2});store.close()
+                self.assertFalse(cp.worker.is_alive())
+                reopened=DurableState(p);self.assertEqual(reopened.load(),{'generation':2});reopened.close()
+
+    def test_background_retains_single_adapter_ownership(self):
+        from unittest.mock import patch
+        with patch.dict(os.environ, {'E2B_SQLITE_JOURNAL':'WAL', 'E2B_SQLITE_CHECKPOINT':'background'}):
+            with tempfile.TemporaryDirectory() as d:
+                p=Path(d)/'state';store=DurableState(p)
+                with self.assertRaises(BlockingIOError):DurableState(p)
+                self.assertFalse(os.get_inheritable(store.owner.fileno()))
+                store.close()
+                replacement=DurableState(p);replacement.close()
+
+    def test_worker_failure_rejects_future_commits(self):
+        from unittest.mock import patch
+        import time
+        from durable_state import WALCheckpointer
+        with patch('durable_state.sqlite3.connect',side_effect=OSError('injected storage failure')):
+            cp=WALCheckpointer('/not-opened')
+            cp.worker.join(5)
+        with self.assertRaisesRegex(RuntimeError,'checkpoint failed'):cp.before_commit()
+        with self.assertRaisesRegex(RuntimeError,'checkpoint failed'):cp.close()

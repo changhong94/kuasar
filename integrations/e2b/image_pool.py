@@ -211,7 +211,8 @@ class ImagePoolBackend(VMBackend):
         image = self.image_catalog[template]
         sid = self.template_pool.lease(body, private=True, binding=dict(
             template_id=template, image_disk=image['disk'],
-            image_sha256=image['sha256'], image_manifest=image['manifest']))
+            image_sha256=image['sha256'], image_manifest=image['manifest'],
+            snapshot_template=entry['key']))
         with self.operation(sid):
             try:
                 started = time.perf_counter_ns()

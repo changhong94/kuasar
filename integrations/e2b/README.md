@@ -648,3 +648,39 @@ from committed database rows before return, so other uncommitted in-memory
 records cannot leak into it. Full save remains available for reconciliation and
 multi-record changes. No transaction durability or guest identity barrier is
 removed, and the projection stays current for existing administration tools.
+
+### Empty-slot startup notification
+
+`KUASAR_POOL_BOOTSTRAP=1` opts the native sandboxer into the matching Cloud
+Hypervisor staging build's `--prepare-config` and `--prepare-ready-fd` interface.
+Leave it unset with older VMM binaries. A mismatched binary fails preparation;
+it does not silently fall back or publish a partially prepared slot.
+
+The native sandboxer first durably writes the generic slot configuration, then
+starts Cloud Hypervisor with that configuration and a one-shot inherited Unix
+socket. Cloud Hypervisor prepares the KVM VM and vCPUs without guest RAM and
+writes byte `1` only after preparation succeeds. Both ends close the notification
+FD; EOF, an invalid byte, or the existing ten-second deadline fails preparation.
+This replaces API-readiness polling plus the external `vmm.prepare` RPC. The
+existing network-cleanup join, template staging, and durable Ready publication
+remain inside measured refill work. It does not change running-parent fork or
+create a VM pool per image.
+
+### Restore immutable templates using the prepared slot identity
+
+`KUASAR_PREPARED_IDENTITY=1` requires a matching Cloud Hypervisor build advertising
+`prepared_identity_v1` in `vmm.ping`. It avoids creating a per-slot restore bundle:
+the VMM reads the sealed original template and applies the already prepared slot's
+NIC, vsock, serial and console identity to its private in-memory configuration.
+Only the matching NIC's snapshot MAC is changed. CPU state, disk paths and memory
+contents remain those of the template; guest RAM uses private file CoW.
+
+The slot's `generic-slot.json` is synchronized before KVM preparation. The selected
+`snapshot_template` key is committed with the private lease before restoration;
+the existing identity/network barriers still precede public Ready publication.
+Unsupported VMMs and incompatible templates fail preparation. This path requires
+plain private RAM, read-only template disks, and one matching NIC plus vsock. It
+does not change running-parent fork or allocate a separate VM pool for each image.
+
+The startup-notification experiment above is independent and remains disabled by
+default: measurements did not establish an advantage over the existing API path.

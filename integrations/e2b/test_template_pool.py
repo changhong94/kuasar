@@ -232,3 +232,10 @@ class PoolTests(unittest.TestCase):
                 lambda: self.pool.status()['ready'] == 1, timeout=2))
         self.assertEqual(self.backend.created, 2)
         self.assertEqual(self.pool.status()['owned'], 1)
+
+    def test_template_identity_commits_before_private_lease_returns(self):
+        self.start(1)
+        sid=self.pool.lease({},private=True,binding={'template_id':'base','snapshot_template':'image-sealed'})
+        self.assertEqual(self.backend.committed[sid]['snapshot_template'],'image-sealed')
+        self.assertEqual(self.backend.committed[sid]['pool_state'],'binding')
+        with self.assertRaises(APIError):self.backend.get_public(sid)

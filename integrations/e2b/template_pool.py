@@ -139,7 +139,7 @@ class TemplatePool:
                     self.condition.wait(1)
 
     def lease(self, body, *, private=False, binding=None):
-        if binding and (not private or set(binding)-{'template_id', 'image_disk', 'image_sha256', 'image_manifest'}):
+        if binding and (not private or set(binding)-{'template_id', 'image_disk', 'image_sha256', 'image_manifest', 'snapshot_template'}):
             raise ValueError('Image binding must be a private assignment')
         started = time.monotonic()
         deadline = started+45

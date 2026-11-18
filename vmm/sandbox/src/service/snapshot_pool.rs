@@ -243,10 +243,46 @@ where
             .file_name()
             .ok_or_else(|| anyhow!("missing template key"))?
             .to_string_lossy();
-        let work = Path::new(&sandbox.base_dir).join(format!("image-restore-{key}"));
+        let prepared_identity =
+            prepared && std::env::var("KUASAR_PREPARED_IDENTITY").as_deref() == Ok("1");
+        let work = if prepared_identity {
+            directory.clone()
+        } else {
+            Path::new(&sandbox.base_dir).join(format!("image-restore-{key}"))
+        };
         let binding = json!({"source":directory,"slot":current});
-        let cached = work.exists();
-        if cached {
+        let cached = !prepared_identity && work.exists();
+        if prepared_identity {
+            // Capability negotiation prevents older VMMs from silently ignoring
+            // the restore option and reusing the template's transport identity.
+            let ping = request(&api, "GET", "vmm.ping", None).await?;
+            if !ping["features"]
+                .as_array()
+                .is_some_and(|v| v.iter().any(|x| x == "prepared_identity_v1"))
+            {
+                return Err(anyhow!("VMM lacks prepared identity restore support"));
+            }
+            let config: Value =
+                serde_json::from_slice(&tokio::fs::read(directory.join("config.json")).await?)?;
+            if config["memory"]["shared"] == true
+                || config["memory"]["hugepages"] == true
+                || config["memory"].get("zones").is_some_and(|v| !v.is_null())
+                || config["cpus"] != current["cpus"]
+                || !config["net"].as_array().is_some_and(|v| v.len() == 1)
+                || config["net"][0]["id"] != current["net"][0]["id"]
+                || config["disks"]
+                    .as_array()
+                    .is_some_and(|v| v.iter().any(|d| d["readonly"] != true))
+            {
+                return Err(anyhow!(
+                    "template incompatible with prepared identity restore"
+                ));
+            }
+            // The sealed template and generic-slot.json are already durable.
+            // Lease publication separately persists the selected template ID.
+            // Re-derivable transport overlays need no per-slot snapshot files.
+            mark("stage_identity_validate");
+        } else if cached {
             let found: Value =
                 serde_json::from_slice(&tokio::fs::read(work.join("binding.json")).await?)?;
             if found != binding {
@@ -342,7 +378,7 @@ where
             "PUT",
             "vm.restore",
             Some(json!({"source_url":format!("file://{}",work.display()),
-            "memory_restore_mode":"CopyOnWrite", "prefault":false})),
+            "memory_restore_mode":"CopyOnWrite", "prefault":false, "prepared_identity":prepared_identity})),
         )
         .await?;
         mark("restore_kvm_devices");
@@ -359,7 +395,15 @@ where
                 let client = crate::client::new_snapshot_sandbox_client(&address).await?;
                 let connect_us = start.elapsed().as_micros();
                 let start = std::time::Instant::now();
-                sandbox.fork_agent_release_network_with_client(&client, token, Some(&old), Some(&seed), manifest["tcp_empty_verified"].as_bool().unwrap_or(false)).await?;
+                sandbox
+                    .fork_agent_release_network_with_client(
+                        &client,
+                        token,
+                        Some(&old),
+                        Some(&seed),
+                        manifest["tcp_empty_verified"].as_bool().unwrap_or(false),
+                    )
+                    .await?;
                 Ok::<_, anyhow::Error>((client, connect_us, start.elapsed().as_micros()))
             },
             async {

@@ -267,7 +267,7 @@ class VMBackend(Backend):
                     # Only a private RAM-less VMM may overlap old-flow cleanup.
                     # Context exit joins cleanup before Running/Ready persistence,
                     # and before the exception path can destroy this generation.
-                    with networks.claim_preparing(sid, reservation) if networks else nullcontext(None) as ns:
+                    with networks.claim_preparing(sid, reservation, native_identity=direct) if networks else nullcontext(None) as ns:
                         reused = ns is not None
                         if ns is None:
                             ns = self.namespace(sid)
@@ -290,7 +290,10 @@ class VMBackend(Backend):
                             ip = self.address(self.get(sid))
                             if not ip:
                                 raise RuntimeError('prepared pool namespace has no IPv4 address')
-                            info = self.admin('sandbox-pool-prepare', source_id=source, sandbox_id=sid, netns=ns)
+                            info = self.admin('sandbox-pool-prepare', source_id=source, sandbox_id=sid, netns=ns,
+                                              network_identity='fresh')
+                            if info.get('network_identity') != 'fresh':
+                                raise RuntimeError('native pool preparation did not confirm fresh network identity')
                         else:
                             info = self.admin('sandbox-fork', source_id=source, sandbox_id=sid, netns=ns, defer_network=True)
                     completion_ns = time.perf_counter_ns()

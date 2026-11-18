@@ -220,7 +220,8 @@ class VMBackendTests(unittest.TestCase):
         events = []
         def admin(action, **kw):
             events.append(action)
-            return {'live_fork': {'pid': 123, 'vsock_socket': 'private-vsock'}}
+            assert kw['network_identity'] == 'fresh'
+            return {'network_identity': 'fresh', 'live_fork': {'pid': 123, 'vsock_socket': 'private-vsock'}}
         with patch.object(self.backend, 'namespace', return_value='owned-ns'), \
              patch.object(self.backend, 'cni_call', side_effect=lambda sid, action: events.append(action)), \
              patch.object(self.backend, 'address', return_value='10.0.0.2'), \
@@ -233,6 +234,20 @@ class VMBackendTests(unittest.TestCase):
         self.assertTrue(self.backend.records[sid]['direct_prepared'])
         self.assertEqual(self.backend.records[sid]['pool_state'], 'preparing')
         self.assertEqual(self.backend.records[sid]['network_state'], 'ready')
+
+    def test_direct_prepare_without_identity_ack_fails_before_publication(self):
+        self.backend.direct_pool_prepare = True
+        self.backend.args.source = 'seed'
+        cleaned = []
+        with patch.object(self.backend, 'namespace', return_value='owned-ns'), \
+             patch.object(self.backend, 'cni_call'), \
+             patch.object(self.backend, 'address', return_value='10.0.0.2'), \
+             patch.object(self.backend, 'admin', return_value={'live_fork': {'pid': 123}}), \
+             patch.object(self.backend, 'destroy', side_effect=cleaned.append):
+            with self.assertRaisesRegex(RuntimeError, 'confirm fresh network identity'):
+                self.backend._create_live({}, _pool_owned=True)
+        self.assertEqual(len(cleaned), 1)
+        self.assertNotIn(cleaned[0], self.backend.jobs)
 
     def test_direct_prepare_failure_retains_normal_cleanup(self):
         self.backend.direct_pool_prepare = True

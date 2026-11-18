@@ -149,6 +149,15 @@ class NetworkPoolTests(unittest.TestCase):
                 published=True
         self.assertFalse(published)
 
+    def test_native_identity_still_joins_cleanup_without_cli_mutation(self):
+        b=self.backend;b.records['net-owned']=dict(self.record,network_only=True,status='network_idle')
+        b.records['new']=dict(token='fresh',pool_state='preparing',status='creating')
+        with patch.object(self.pool,'owned'),patch.object(self.pool,'run') as run,patch.object(self.pool,'clear_host_conntrack') as clear:
+            with self.pool.claim_preparing('new', native_identity=True) as ns:
+                self.assertEqual(ns, self.record['netns'])
+            run.assert_not_called()
+            clear.assert_called_once()
+
     def test_reservation_commits_creation_and_transfer_once_before_side_effects(self):
         b=self.backend;b.records['net-owned']=dict(self.record,network_only=True,status='network_idle')
         b.records['new']=dict(token='fresh',pool_state='preparing',status='creating')

@@ -111,7 +111,7 @@ class NetworkPool:
             return namespace
 
     @contextmanager
-    def claim_preparing(self, sid, reservation=None):
+    def claim_preparing(self, sid, reservation=None, native_identity=False):
         """Allow only private, RAM-less KVM preparation during old-flow cleanup.
 
         The caller must leave this scope before publishing or restoring a guest.
@@ -128,7 +128,10 @@ class NetworkPool:
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
             cleanup = executor.submit(self.clear_host_conntrack, copy)
             try:
-                self.run(['ip', 'link', 'set', 'dev', 'eth0', 'address', address], copy)
+                # Direct preparation can set the MAC through native netlink.
+                # Its caller must verify the acknowledgement before publication.
+                if not native_identity:
+                    self.run(['ip', 'link', 'set', 'dev', 'eth0', 'address', address], copy)
                 trace_timing('network_claim_identity', started, sid=sid)
                 yield copy['netns']
             finally:

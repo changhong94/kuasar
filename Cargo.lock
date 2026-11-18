@@ -5066,6 +5066,7 @@ dependencies = [
  "log",
  "netlink-packet-core 0.7.0",
  "netlink-packet-route 0.19.0",
+ "netlink-packet-utils",
  "nix 0.26.4",
  "oci-spec 0.5.8",
  "os_pipe 0.9.2",

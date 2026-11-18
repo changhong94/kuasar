@@ -1452,6 +1452,11 @@ where
     let slot = handle.sandboxes.read().await.get(id).cloned().unwrap();
     let result = async {
         let mut sandbox = slot.lock().await;
+        let fresh_identity = req["network_identity"].as_str() == Some("fresh");
+        if fresh_identity {
+            crate::network::refresh_pool_identity(netns).await?;
+        }
+        mark("network_identity");
         sandbox.prepare_network().await?;
         mark("network_prepare");
         let network = sandbox.network.as_ref().ok_or_else(|| anyhow!("missing slot network"))?;
@@ -1466,7 +1471,7 @@ where
         sandbox.data.task_address = format!("ttrpc+{}", sandbox.vm.socket_address());
         sandbox.dump().await?;
         mark("identity_dump");
-        Ok(json!({"ok":true,"id":id,"live_fork":sandbox.vm.live_fork_info(),"direct_prepared":true}))
+        Ok(json!({"ok":true,"id":id,"live_fork":sandbox.vm.live_fork_info(),"direct_prepared":true,"network_identity":if fresh_identity { "fresh" } else { "unchanged" }}))
     }.await;
     match result {
         Ok(response) => { monitor(slot); Ok(response) }

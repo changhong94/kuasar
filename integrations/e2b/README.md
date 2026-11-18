@@ -684,3 +684,22 @@ does not change running-parent fork or allocate a separate VM pool for each imag
 
 The startup-notification experiment above is independent and remains disabled by
 default: measurements did not establish an advantage over the existing API path.
+
+### Native network preparation for generic slots
+
+Direct generic-slot preparation now requests `network_identity="fresh"` from
+`sandbox-pool-prepare`. The sandboxer changes the owned veth MAC through netlink
+before discovering the guest NIC configuration. The adapter requires the matching
+acknowledgement; older native binaries fail closed before a slot can be published.
+Running-parent fork retains its existing identity path.
+
+Ingress qdiscs, bidirectional redirect filters and the priority-1 drop barrier
+are installed directly through netlink, with kernel acknowledgements and exclusive
+creation. Removing the barrier preserves the priority-100 redirects. No `tc` or
+`nsenter + ip` subprocess is needed for this preparation path. Cleanup still joins
+before restoration; the old VM is reaped, stale connections are cleared, and the
+slot configuration and ownership records remain durable before publication.
+
+`CH_FORK_TIMING=1` additionally reports `VM_POOL_PREPARE` stages (validation,
+MSR profile, KVM VM, each vCPU and parking). These are nested within the host's
+`POOL_VMM_PHASE` and `POOL_PREPARE_PHASE` timers, not additional elapsed work.

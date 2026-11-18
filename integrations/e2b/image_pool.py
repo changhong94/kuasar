@@ -99,6 +99,12 @@ class ImagePoolBackend(VMBackend):
         self.direct_pool_prepare = os.environ.get('E2B_SNAPSHOT_POOL') == '1'
         self.snapshot_templates = {}
         self.snapshot_lock = threading.RLock()
+        self.manifest_templates = None
+        if os.environ.get("E2B_MANIFEST_CONFIG"):
+            from manifest_templates import ManifestTemplates
+            self.manifest_templates = ManifestTemplates(
+                os.environ["E2B_MANIFEST_RAW"], os.environ["E2B_MANIFEST_CONFIG"],
+                os.environ["KUASAR_SNAPSHOT_POOL_ROOT"])
         super().__init__(args)
         if (os.environ.get('E2B_SNAPSHOT_POOL') == '1'
                 and os.environ.get('E2B_EAGER_IMAGE_TEMPLATES') == '1'):
@@ -165,6 +171,8 @@ class ImagePoolBackend(VMBackend):
                              warmup_ms=(time.monotonic()-warm)*1000,
                              memory_bytes=memory.stat().st_size,
                              allocated_bytes=memory.stat().st_blocks*512)
+                if getattr(self, "manifest_templates", None):
+                    entry["manifest_descriptor"] = self.manifest_templates.publish(saved["directory"])
                 staged = self.stage_snapshot_slots(entry)
                 entry.update(staged)
                 self.snapshot_templates[template] = entry
@@ -201,7 +209,7 @@ class ImagePoolBackend(VMBackend):
                         with self.lock:
                             record['pool_state'] = 'ready'
                             self.save_record(sid)
-                            pool.condition.notify_all()
+                            pool.ready_changed()
                         count += 1
                     except Exception:
                         with self.lock:
@@ -223,6 +231,11 @@ class ImagePoolBackend(VMBackend):
             return self._create_image(body, parent)
         self.validate_create(body)
         template = body.get('templateID', self.args.template)
+        mode = body.get('snapshotMode', body.get('metadata', {}).get('kuasar.snapshot.mode', 'local'))
+        if mode not in ('local', 'manifest'):
+            raise APIError(400, 'snapshotMode must be local or manifest')
+        if mode == 'manifest' and not getattr(self, 'manifest_templates', None):
+            raise APIError(503, 'Manifest template backend is not configured')
         entry = self.prepare_snapshot(template)
         image = self.image_catalog[template]
         sid = self.template_pool.lease(body, private=True, binding=dict(
@@ -232,6 +245,14 @@ class ImagePoolBackend(VMBackend):
         with self.operation(sid):
             try:
                 started = time.perf_counter_ns()
+                if mode == 'manifest':
+                    key = 'remote-' + sid
+                    with self.lock:
+                        self.get(sid)['remote_template'] = key
+                        self.save_record(sid)  # Ownership before any materialization.
+                    restored = self.manifest_templates.restore(entry['manifest_descriptor'], key)
+                    entry = {**entry, **restored}
+                    trace_timing('manifest_restore', started, sid=sid, details=restored)
                 result = self.admin('sandbox-snapshot-bind', sandbox_id=sid, template=entry['key'])
                 trace_timing('snapshot_bind', started, sid=sid, details=result)
                 record = self.get(sid)
@@ -372,6 +393,10 @@ class ImagePoolBackend(VMBackend):
         if getattr(self, 'slot_disks', None) is not None:
             with self.lock:
                 self.slot_disks.collect({r['slot_disk'] for r in self.records.values() if r.get('slot_disk')})
+        if getattr(self, 'manifest_templates', None):
+            with self.lock:
+                self.manifest_templates.collect({r['remote_template'] for r in self.records.values()
+                                                 if r.get('remote_template')})
         trace_timing('delete_disk_collect', started, sid=sid)
 
     def execute_process(self, sid, process, user=None):

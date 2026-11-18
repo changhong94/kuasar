@@ -50,6 +50,9 @@ fn rewrite_mac(snapshot: &mut Value, id: &str, mac: &[u8]) -> anyhow::Result<boo
                         .ok_or_else(|| anyhow!("missing NIC state"))?,
                 )?;
                 state["config"]["mac"] = json!(mac);
+                // This is a new identity, not migration of the old endpoint.
+                // Keep the existing host/guest gates until ForkControl completes.
+                state["fork_identity_reset"] = json!(true);
                 child["snapshot_data"]["state"] = json!(serde_json::to_string(&state)?);
                 return Ok(true);
             }
@@ -420,4 +423,28 @@ where
     Ok(
         json!({"ok":true,"directory":directory,"elapsed_ms":started.elapsed().as_secs_f64()*1000.0,"phases":phases,"initial_process":initial_sample}),
     )
+}
+
+#[cfg(test)]
+mod network_identity_tests {
+    use super::*;
+
+    #[test]
+    fn fork_marks_only_the_derived_nic_for_identity_reset() {
+        let nic = json!({"config":{"mac":[2,0,0,0,0,1]},"queue_size":[256,256,256]});
+        let parent = json!({"snapshots":{"devices":{"snapshots":{
+            "fork-net":{"snapshot_data":{"state":serde_json::to_string(&nic).unwrap()}},
+            "other":{"snapshot_data":{"state":"untouched"}}
+        }}}});
+        let mut child = parent.clone();
+        assert!(rewrite_mac(&mut child,"fork-net",&[2,0,0,0,0,2]).unwrap());
+        let state: Value = serde_json::from_str(child["snapshots"]["devices"]["snapshots"]["fork-net"]["snapshot_data"]["state"].as_str().unwrap()).unwrap();
+        assert_eq!(state["config"]["mac"],json!([2,0,0,0,0,2]));
+        assert_eq!(state["fork_identity_reset"],true);
+        assert_eq!(state["queue_size"],nic["queue_size"]);
+        assert_eq!(child["snapshots"]["devices"]["snapshots"]["other"],parent["snapshots"]["devices"]["snapshots"]["other"]);
+        let original: Value = serde_json::from_str(parent["snapshots"]["devices"]["snapshots"]["fork-net"]["snapshot_data"]["state"].as_str().unwrap()).unwrap();
+        assert!(original.get("fork_identity_reset").is_none());
+        assert_eq!(original["config"]["mac"],json!([2,0,0,0,0,1]));
+    }
 }

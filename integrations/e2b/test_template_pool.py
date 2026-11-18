@@ -69,9 +69,129 @@ class PoolTests(unittest.TestCase):
             self.pool.close()
         self.tmp.cleanup()
 
-    def start(self, n):
-        self.pool = TemplatePool(self.backend, n, refill_delay=0)
+    def start(self, n, workers=1):
+        self.pool = TemplatePool(self.backend, n, workers=workers)
         self.backend.template_pool = self.pool
+
+    def test_startup_prepares_in_parallel_before_publishing_ready(self):
+        barrier = threading.Barrier(4)
+        lock = threading.Lock()
+        active = peak = entered = 0
+        def prepare(sid):
+            nonlocal active, peak, entered
+            with lock:
+                active += 1
+                peak = max(peak, active)
+                entered += 1
+                first_wave = entered <= 4
+            try:
+                if first_wave:
+                    barrier.wait(timeout=3)
+                self.assertNotEqual(self.backend.get(sid).get('pool_state'), 'ready')
+            finally:
+                with lock:
+                    active -= 1
+        self.backend.prepare_slot = prepare
+        self.start(9, workers=4)
+        self.assertEqual(peak, 4)
+        self.assertEqual(entered, 9)
+        self.assertEqual(self.pool.status()['ready'], 9)
+        self.assertEqual(self.pool.status()['preparing'], 0)
+        self.assertEqual(self.pool.status()['pending'], 0)
+        self.assertEqual(len(self.backend.committed), 9)
+
+    def test_parallel_reservations_are_bounded_before_record_creation(self):
+        self.pool = TemplatePool(self.backend, 2, workers=8)
+        self.backend.template_pool = self.pool
+        original = self.backend._create_live
+        gate = threading.Event()
+        entered = threading.Barrier(3)
+        def blocked(*args, **kwargs):
+            entered.wait(timeout=3)
+            gate.wait(timeout=3)
+            return original(*args, **kwargs)
+        self.backend._create_live = blocked
+        try:
+            ids = [self.pool.lease({})['sandboxID'] for _ in range(2)]
+            entered.wait(timeout=3)
+            self.assertEqual(self.pool.status()['pending'], 2)
+            self.assertEqual(self.pool.status()['preparing'], 2)
+            self.assertEqual(self.backend.created, 2)
+        finally:
+            gate.set()
+        with self.pool.condition:
+            self.assertTrue(self.pool.condition.wait_for(lambda: self.pool.status()['ready'] == 2, 3))
+        self.assertEqual(self.backend.created, 4)
+        self.assertEqual(self.pool.status()['assigned'], 2)
+        import json
+        events = [json.loads(line) for line in self.pool.events.read_text().splitlines()]
+        replacements = [e['vacancy_sid'] for e in events if e['event'] == 'prepared' and e['reason'] == 'refill']
+        self.assertCountEqual(replacements, ids)
+
+    def test_parallel_drain_waits_for_all_preparations(self):
+        self.pool = TemplatePool(self.backend, 2, workers=2)
+        self.backend.template_pool = self.pool
+        original = self.backend._create_live
+        gate = threading.Event()
+        entered = threading.Barrier(3)
+        def blocked(*args, **kwargs):
+            entered.wait(timeout=3)
+            gate.wait(timeout=3)
+            return original(*args, **kwargs)
+        self.backend._create_live = blocked
+        try:
+            ids = [self.pool.lease({})['sandboxID'] for _ in range(2)]
+            entered.wait(timeout=3)
+            with concurrent.futures.ThreadPoolExecutor(1) as executor:
+                done = executor.submit(self.pool.drain)
+                with self.pool.condition:
+                    self.assertTrue(self.pool.condition.wait_for(lambda: not self.pool.enabled, 3))
+                self.assertFalse(done.done())
+                gate.set()
+                done.result(timeout=3)
+        finally:
+            gate.set()
+        self.assertCountEqual(self.backend.records, ids)
+        self.assertEqual(self.pool.status()['preparing'], 0)
+        self.assertEqual(self.pool.status()['pending'], 0)
+
+    def test_parallel_failure_releases_reservation_and_retries_original_vacancy(self):
+        self.start(2, workers=4)
+        original = self.backend._create_live
+        failed = threading.Event()
+        def create(*args, **kwargs):
+            with self.backend.lock:
+                if not failed.is_set():
+                    failed.set()
+                    raise RuntimeError('injected preparation failure before record creation')
+            return original(*args, **kwargs)
+        self.backend._create_live = create
+        ids = [self.pool.lease({})['sandboxID'] for _ in range(2)]
+        with self.pool.condition:
+            self.assertTrue(self.pool.condition.wait_for(
+                lambda: self.pool.status()['ready'] == 2 and not self.pool.inflight, 4))
+        self.assertTrue(failed.is_set())
+        self.assertEqual(self.pool.pending, 0)
+        self.assertEqual(self.backend.created, 4)
+        import json
+        events = [json.loads(line) for line in self.pool.events.read_text().splitlines()]
+        replacements = [e['vacancy_sid'] for e in events if e['event'] == 'prepared' and e['reason'] == 'refill']
+        self.assertCountEqual(replacements, ids)
+
+    def test_close_wakes_waiting_claims_on_separate_ready_condition(self):
+        self.start(1, workers=2)
+        # Quarantined ownership consumes reserve budget without publishing Ready.
+        with self.pool.condition:
+            self.backend.records['1']['pool_state'] = 'quarantined'
+        with concurrent.futures.ThreadPoolExecutor(1) as workers:
+            waiting = workers.submit(self.pool.lease, {})
+            deadline = time.monotonic()+2
+            while not self.pool.misses and time.monotonic() < deadline:
+                time.sleep(.001)
+            self.assertEqual(self.pool.misses, 1)
+            self.pool.close()
+            with self.assertRaises(APIError):
+                waiting.result(timeout=2)
 
     def test_private_slots_and_concurrent_single_use_assignment(self):
         self.start(10)
@@ -81,29 +201,30 @@ class PoolTests(unittest.TestCase):
         with concurrent.futures.ThreadPoolExecutor(10) as workers:
             rows = list(workers.map(lambda _: self.backend.create({'metadata': {'leased': 'yes'}}), range(10)))
         self.assertEqual(len({r['sandboxID'] for r in rows}), 10)
-        self.assertEqual(self.backend.created, 10)
+        self.assertGreaterEqual(self.backend.created, 10)
+        self.assertLessEqual(self.pool.status()['reserves'], 10)
         self.assertEqual(self.pool.status()['assigned'], 10)
         for row in rows:
             self.assertEqual(self.backend.committed[row['sandboxID']]['pool_state'], 'leased')
             self.assertEqual(row['metadata'], {'leased': 'yes'})
 
-    def test_exhaustion_waits_for_retirement_and_replacement(self):
-        self.start(1)
-        first = self.backend.create({})['sandboxID']
-        entered = threading.Event()
-        def create():
-            entered.set()
-            return self.backend.create({})
-        with concurrent.futures.ThreadPoolExecutor() as workers:
-            waiting = workers.submit(create)
-            self.assertTrue(entered.wait(2))
-            time.sleep(.02)
-            self.assertFalse(waiting.done())
-            self.assertEqual(self.backend.created, 1)
-            self.backend.destroy(first)
-            second = waiting.result(2)['sandboxID']
-        self.assertNotEqual(first, second)
-        self.assertEqual(self.pool.status()['owned'], 1)
+    def test_claim_refills_without_destroying_any_running_instance(self):
+        self.start(2)
+        with concurrent.futures.ThreadPoolExecutor(16) as workers:
+            rows = list(workers.map(lambda _: self.backend.create({}), range(256)))
+        ids = {r['sandboxID'] for r in rows}
+        self.assertEqual(len(ids), 256)
+        with self.pool.condition:
+            self.assertTrue(self.pool.condition.wait_for(
+                lambda: self.pool.status()['ready'] == 2, timeout=2))
+        self.assertEqual(self.pool.status()['assigned'], 256)
+        self.assertEqual(self.pool.status()['owned'], 258)
+        self.assertEqual(self.pool.status()['reserves'], 2)
+        for sid in ids:
+            self.assertEqual(self.backend.committed[sid]['pool_state'], 'leased')
+            self.backend.destroy(sid)
+        self.assertEqual(self.pool.status()['ready'], 2)
+        self.assertEqual(self.backend.created, 258)
 
     def test_failed_acknowledgment_quarantines_slot_even_after_commit(self):
         self.start(1)
@@ -119,6 +240,7 @@ class PoolTests(unittest.TestCase):
         self.start(2)
         parent = self.backend.create({})['sandboxID']
         self.backend.records[parent]['value'] = 123
+        self.pool.close()  # settle concurrent refill before observing live fork
         ready = self.pool.status()['ready']
         child = self.backend.create({}, parent)['sandboxID']
         self.assertEqual(self.backend.parents[-1], parent)
@@ -134,29 +256,22 @@ class PoolTests(unittest.TestCase):
             self.backend.create({'timeout': 0})
         self.assertEqual(self.pool.status()['ready'], 1)
 
-    def test_recovered_leases_count_against_capacity(self):
+    def test_recovered_leases_do_not_consume_reserve_capacity(self):
         self.backend.records['existing'] = dict(pool_origin=True, pool_state='leased',
                                                 status='running', network_state='ready')
         self.start(1)
-        self.assertEqual(self.backend.created, 0)
+        self.assertEqual(self.backend.created, 1)
         self.assertEqual(self.pool.status()['assigned'], 1)
-        self.assertEqual(self.pool.status()['ready'], 0)
+        self.assertEqual(self.pool.status()['ready'], 1)
 
 
-    def test_drain_wakes_exhausted_clients_without_assigning(self):
+    def test_drain_never_destroys_public_leases(self):
         self.start(1)
         first = self.backend.create({})['sandboxID']
-        with concurrent.futures.ThreadPoolExecutor() as workers:
-            waiting = workers.submit(self.backend.create, {})
-            deadline = time.monotonic()+2
-            while self.pool.status()['misses'] == 0 and time.monotonic()<deadline:
-                time.sleep(.001)
-            self.assertEqual(self.pool.status()['misses'], 1)
-            self.pool.drain()
-            with self.assertRaises(APIError):
-                waiting.result(2)
+        self.pool.drain()
+        with self.assertRaises(APIError):self.pool.lease({})
         self.assertIn(first, self.backend.records)
-        self.assertEqual(self.backend.created, 1)
+        self.assertEqual(self.pool.status()['ready'], 0)
 
     def test_network_failure_never_publishes_ready_slot(self):
         original = self.backend._create_live
@@ -172,13 +287,26 @@ class PoolTests(unittest.TestCase):
 
     def test_private_claim_cannot_execute_or_be_reassigned_before_binding(self):
         self.start(1)
-        sid = self.pool.lease({}, private=True)
-        self.assertEqual(self.backend.committed[sid]['pool_state'], 'binding')
-        self.assertEqual(self.pool.status()['ready'], 0)
+        with self.pool.condition:
+            sid = self.pool.lease({}, private=True)
+            self.assertEqual(self.backend.committed[sid]['pool_state'], 'binding')
+            self.assertEqual(self.pool.status()['ready'], 0)
         with self.assertRaises(APIError):
             self.backend.get_public(sid)
         self.pool.drain()
         self.assertEqual(self.backend.records, {})
+
+    def test_private_binding_releases_reserve_but_remains_inaccessible(self):
+        self.start(1)
+        sid = self.pool.lease({}, private=True, binding={'template_id': 'base'})
+        with self.pool.condition:
+            self.assertTrue(self.pool.condition.wait_for(
+                lambda: self.pool.status()['ready'] == 1, timeout=2))
+        self.assertEqual(self.backend.committed[sid]['pool_state'], 'binding')
+        self.assertEqual(self.pool.status()['binding'], 1)
+        self.assertEqual(self.pool.status()['reserves'], 1)
+        self.assertEqual(self.pool.status()['owned'], 2)
+        with self.assertRaises(APIError):self.backend.get_public(sid)
 
     def test_device_preparation_overlaps_network_but_publication_waits(self):
         original = self.backend._create_live
@@ -215,23 +343,37 @@ class PoolTests(unittest.TestCase):
             self.start(1)
         self.assertEqual(self.backend.records, {})
 
-    def test_lease_starts_delay_but_never_overcommits_before_retirement(self):
-        self.pool = TemplatePool(self.backend, 1, refill_delay=60)
-        self.backend.template_pool = self.pool
-        sid = self.backend.create({})['sandboxID']
-        self.assertIsNotNone(self.pool.due)
-        with self.pool.condition:
-            self.pool.due = time.monotonic()-1
-            self.pool.condition.notify_all()
-        time.sleep(.02)
-        self.assertEqual(self.backend.created, 1)
-        self.assertEqual(self.pool.status()['owned'], 1)
-        self.backend.destroy(sid)
+    def test_refill_cannot_start_until_assignment_commit_finishes(self):
+        self.start(1, workers=8)
+        entered = threading.Event()
+        release = threading.Event()
+        original_save = self.backend.save
+        original_create = self.backend._create_live
+        observed = []
+        def save():
+            if self.backend.records.get('1', {}).get('pool_state') == 'leased' and not release.is_set():
+                entered.set()
+                if not release.wait(2):raise TimeoutError('test commit gate')
+            original_save()
+        def create(*args, **kwargs):
+            observed.append(self.backend.committed['1']['pool_state'])
+            return original_create(*args, **kwargs)
+        self.backend.save = save
+        self.backend._create_live = create
+        with concurrent.futures.ThreadPoolExecutor() as workers:
+            lease = workers.submit(self.backend.create, {})
+            try:
+                self.assertTrue(entered.wait(2))
+                self.assertEqual(observed, [])
+                self.assertEqual(self.backend.created, 1)
+            finally:release.set()
+            self.assertEqual(lease.result(2)['sandboxID'], '1')
         with self.pool.condition:
             self.assertTrue(self.pool.condition.wait_for(
                 lambda: self.pool.status()['ready'] == 1, timeout=2))
-        self.assertEqual(self.backend.created, 2)
-        self.assertEqual(self.pool.status()['owned'], 1)
+        self.assertEqual(observed, ['leased'])
+        self.assertIn('1', self.backend.records)
+        self.assertEqual(self.pool.status()['refill_delay_ms'], 0)
 
     def test_template_identity_commits_before_private_lease_returns(self):
         self.start(1)

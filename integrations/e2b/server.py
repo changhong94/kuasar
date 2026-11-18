@@ -517,7 +517,11 @@ def main():
         if not args.k3s or not args.kubeconfig:
             p.error('--k3s and --kubeconfig are required for the Kubernetes backend')
         backend = Backend(args)
-    server = ThreadingHTTPServer((args.listen, args.port), Handler)
+    # Accept a burst while request threads perform their durable assignments.
+    # This only changes the kernel accept backlog, not publication barriers.
+    class SandboxHTTPServer(ThreadingHTTPServer):
+        request_queue_size = 512
+    server = SandboxHTTPServer((args.listen, args.port), Handler)
     server.backend = backend
     threading.Thread(target=backend.reap, daemon=True).start()
     print('E2B compatible API listening on', server.server_address, flush=True)

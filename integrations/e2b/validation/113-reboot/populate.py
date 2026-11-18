@@ -31,7 +31,6 @@ ExecStartPre=/usr/bin/mkdir -p /run/containerd
 Environment=E2B_DURABLE_STORE=sqlite
 Environment=KUASAR_FORK_RUNTIME_DIR=/run/python113-fork
 Environment=E2B_TEMPLATE_POOL_SIZE=2
-Environment=E2B_TEMPLATE_POOL_REFILL_DELAY_MS=1000
 Environment=E2B_IMAGE_CATALOG=/home/hong/src/research/python-latest-113/deploy/fork/images.json
 Environment=E2B_DURABLE_SQLITE_ROOT=/home/hong/src/research/python-latest-113/control/fork-sqlite
 Environment=E2B_SNAPSHOT_POOL=1

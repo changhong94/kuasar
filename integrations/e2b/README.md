@@ -1,8 +1,10 @@
 # Default E2B SDK backend: asynchronous VM networking
 
-The default adapter backend now uses Kuasar's VM admin API directly. The normal,
-unmodified E2B Python SDK `Sandbox.create()`, `parent.fork()`, `commands.run()`,
-files and `kill()` methods use this backend without a client-side feature flag.
+The default adapter backend now uses Kuasar's VM admin API directly. The unmodified E2B Python SDK supports `Sandbox.create()`, `commands.run()`,
+files and `kill()` through this backend. Live fork uses this adapter's explicit
+HTTP extension, `POST /sandboxes/{parent_id}/fork`. The SDK installed on the
+113 benchmark host is 2.25.1 and has no `Sandbox.fork()` method. Do not assume
+a native SDK fork method is available.
 The prior Kubernetes backend remains available with `--backend kubernetes`.
 Changing the default does not change CRI/kubelet networking behavior.
 
@@ -30,12 +32,42 @@ other templates must provide it. The fork restrictions of the VM backend still
 apply. A sandbox whose own network is pending must finish provisioning before
 it can become the source of another fork; its commands do not wait for CNI.
 
+## Forking a running sandbox over HTTP
+
+Fork is an adapter extension, not a method added to the installed E2B SDK.
+The server accepts `count=1` and returns HTTP 201 with a list containing
+`{"sandbox": {"sandboxID": ...}}`. Use the returned ID with the SDK:
+
+```python
+import json
+import urllib.request
+from e2b import Sandbox
+
+def fork_running(parent, *, api_key, api_url, timeout=600, **sdk_options):
+    request = urllib.request.Request(
+        api_url.rstrip("/") + "/sandboxes/" + parent.sandbox_id + "/fork",
+        data=json.dumps({"count": 1, "timeout": timeout}).encode(),
+        headers={"X-API-Key": api_key, "Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=150) as response:
+        child_id = json.load(response)[0]["sandbox"]["sandboxID"]
+    return Sandbox.connect(
+        child_id, timeout=timeout, api_key=api_key, api_url=api_url, **sdk_options
+    )
+
+options = dict(api_key="<key>", api_url="http://127.0.0.1:18887",
+               sandbox_url="http://127.0.0.1:18887", request_timeout=150)
+```
+
+This endpoint derives the running parent's current state; it does not claim a
+template-pool child. For end-to-end measurements, start the timer before the
+HTTP request and retain SDK connection and command startup in the timed path.
+
 Network readiness is separate from execution readiness:
 
 ```python
-child = parent.fork(count=1, timeout=600)[0]
-if isinstance(child, Exception):
-    raise child
+child = fork_running(parent, **options)
 result = child.commands.run("python3 -u -c 'print(123)'", user="root")
 print(result.stdout)
 print(child.get_info().metadata["kuasar.network.status"])  # pending/configuring/ready/failed
@@ -128,7 +160,8 @@ physical-device power-loss certification.
 
 This adapter implements a restricted E2B API using Kubernetes Pods backed by the
 `sandbox_fork` branches of containerd, Kuasar and Cloud Hypervisor. It is tested
-with the **unmodified E2B Python SDK 2.64.0**. It does not run the upstream E2B
+through the E2B-compatible API. The current 113 benchmark environment uses
+**E2B Python SDK 2.25.1** plus the HTTP fork extension documented below. It does not run the upstream E2B
 orchestrator or envd, and does not create a memory snapshot file.
 
 Supported operations:
@@ -138,7 +171,7 @@ Supported operations:
   PID, stdout, stderr and exit status using E2B's Connect JSON stream protocol.
 - `sandbox.files.write/read`: transfer text or binary files into the guest
   container, including multipart and octet-stream uploads.
-- `sandbox.fork(count=1)`: derive another Pod from the running source Pod UID.
+- `POST /sandboxes/{parent_id}/fork`: derive another Pod from the running source Pod UID.
   The inherited main container and its descendant processes continue running.
 - `sandbox.kill`: delete its Pod through Kubernetes, followed by normal kubelet
   stop/remove and CNI cleanup. Sandbox expiry also deletes the Pod.
@@ -185,9 +218,7 @@ options = dict(api_key="<key>", api_url="http://127.0.0.1:18881",
                sandbox_url="http://127.0.0.1:18881", request_timeout=150)
 parent = Sandbox.create(timeout=600, **options)
 parent.files.write("/tmp/message", b"inherited", user="root")
-child = parent.fork(count=1, timeout=600)[0]
-if isinstance(child, Exception):
-    raise child
+child = fork_running(parent, **options)
 child.files.write("/tmp/message", b"child", user="root")
 print(parent.files.read("/tmp/message", user="root"))  # inherited
 print(child.commands.run("/bin/busybox cat /tmp/message", user="root").stdout)
@@ -297,14 +328,37 @@ copy is introduced. Existing VM safety and disk persistence barriers remain.
 
 A create durably assigns a single-use slot, fresh access token, metadata and
 expiry before responding. Ready/preparing/quarantined slots are not accessible
-through sandbox or guest APIs. Capacity includes assigned and retiring members;
-deleting a member opens capacity for serial background refill. Exhaustion waits
-up to 45 seconds and returns 503 if no slot becomes available. The default
-`E2B_TEMPLATE_POOL_REFILL_DELAY_MS=1000` starts when a successful lease consumes
-Ready capacity. Refilling still waits for completed retirement to release owned
-capacity; it does not restart the full delay after deletion. Recovery/retirement
-without a pending lease deadline starts a fresh delay. Report the configured
-delay, actual preparation work and client-observed pool recovery separately.
+through sandbox or guest APIs. Capacity targets unclaimed reserve VMs, not
+running user sandboxes. A successful durable assignment removes the claimed
+slot from this budget, including its private image-binding phase, and wakes
+bounded parallel background refill immediately. Each replacement gets its own VM and
+network identity; the claimed VM is never recycled. Running instances remain
+owned and recoverable until explicit deletion or expiry. Destruction does not
+open a second vacancy for an already claimed slot. A failed assignment remains
+quarantined and unavailable; safety and persistence barriers are unchanged.
+Exhaustion waits up to 45 seconds and returns 503 if no slot becomes available.
+`E2B_TEMPLATE_POOL_WORKERS` controls concurrent refill preparations (1..64,
+VM-adapter default 8). Capacity reservations are made under the same lock as
+assignment, before creating resources, so workers cannot overfill the reserve.
+A claim opens its vacancy only after the durable assignment commits. Ready
+publication still waits for device/network preparation and its durable commit.
+Claim waiters and refill workers use separate conditions; one new Ready slot
+wakes one waiting claim instead of waking every pending request. Draining joins
+all in-flight preparations, and never publishes their slots after disabling.
+Native RAM-less pool preparation hands the global transaction lock to the
+registered sandbox's own lifecycle lock before network/KVM preparation. The
+source configuration has already been copied; live-parent fork retains its
+original safety gate. Per-slot preparation events report phase durations and
+keep each vacancy associated with its worker even when jobs finish out of order.
+There is no artificial normal-path refill delay. The legacy
+`E2B_TEMPLATE_POOL_REFILL_DELAY_MS` setting is no longer consumed;
+`refill_delay_ms` remains zero in status for compatibility. Preparation failures
+retain a retry backoff. Status separates `reserves`, `binding`, `assigned` and
+`owned`; `capacity_scope` is `unclaimed_reserves`. Refill events identify the
+claim via `vacancy_sid`; `replacement_ms` starts at durable claim completion.
+The HTTP accept backlog is 512 so concurrent clients can reach admission;
+this does not bypass assignment or image-publication barriers.
+Report actual preparation work and client-observed recovery separately.
 There is no tenant recycling. DELETE remains synchronous: it confirms VM exit,
 CNI DEL, namespace cleanup and durable record removal before returning.
 
@@ -848,3 +902,37 @@ sudo unshare --mount --pid --fork --mount-proc env \
   OCI_WORKER_TEST_PROBE="$test_dir/probe" \
   python3 integrations/e2b/test_oci_worker.py -v
 ```
+
+
+## Manifest-backed snapshot creation
+
+Set `E2B_MANIFEST_RAW` to the accelerator `manifest-raw` binary and
+`E2B_MANIFEST_CONFIG` to a private Manifest configuration file. Existing native
+image templates are published through the existing chunking, compression,
+encryption and deduplication pipeline during preparation. Request restoration
+with `snapshotMode: "manifest"` on HTTP create, or SDK metadata
+`{"kuasar.snapshot.mode": "manifest"}`. Native creation remains the default.
+
+This initial backend eagerly reconstructs the entire sparse template into a
+private directory before VM binding. It verifies fetched content and syncs files
+and directories before atomic publication. These costs are inside create timing;
+this is not UFFD demand paging. Live-parent HTTP fork still inherits running
+state. Descendants retain references to a materialized template until its last
+owner is destroyed. Do not compare this path to lazy restoration without stating
+this implementation difference.
+
+For chunk-source measurements, enable the accelerator cache's optional RocksDB
+statistics. Ordinary Block Cache hits are not proof of chunk payload residency.
+The report records successful payload reads classified as memory, RocksDB file,
+origin or unknown, both by request count and encoded/encrypted returned bytes.
+RocksDB file reads do not necessarily imply physical device IO.
+
+### Initial reserve preparation
+
+`E2B_TEMPLATE_POOL_WORKERS` bounds both initial preparation and later refill.
+Startup prepares reserves in parallel waves and waits for every wave to settle
+before publishing completion. A pending reservation can conservatively overlap
+its newly persisted record, so startup fills any remaining vacancy in a later
+wave instead of assuming each submitted job created a slot. Each slot still
+requires successful device/network readiness and a durable Ready commit.
+Running instances do not consume the reserve budget after durable assignment.

@@ -65,7 +65,7 @@ class ImagePoolTests(unittest.TestCase):
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory()
         self.backend=FakeImages(Path(self.tmp.name)/'state')
-        self.pool=TemplatePool(self.backend,2,refill_delay=0)
+        self.pool=TemplatePool(self.backend,2)
         self.backend.template_pool=self.pool
         for r in self.backend.records.values():r['vsock_socket']='test-vsock'
     def tearDown(self):
@@ -83,7 +83,8 @@ class ImagePoolTests(unittest.TestCase):
             b=self.backend.create({'templateID':'second'})
         self.assertNotEqual(a['sandboxID'],b['sandboxID'])
         self.assertEqual(a['template_id'],'base');self.assertEqual(b['template_id'],'second')
-        self.assertEqual(self.backend.created,2)
+        self.assertGreaterEqual(self.backend.created,2)
+        self.assertLessEqual(self.pool.status()['reserves'],2)
         self.assertEqual(self.pool.status()['assigned'],2)
         self.assertEqual(set(attached),{x['disk'] for x in self.backend.image_catalog.values()})
         for sid in [a['sandboxID'],b['sandboxID']]:

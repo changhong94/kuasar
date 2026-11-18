@@ -93,8 +93,7 @@ class VMBackend(CheckpointBackend, Backend):
         capacity = int(os.environ.get('E2B_TEMPLATE_POOL_SIZE', '0'))
         if capacity:
             from template_pool import TemplatePool
-            self.template_pool = TemplatePool(self, capacity,
-                float(os.environ.get('E2B_TEMPLATE_POOL_REFILL_DELAY_MS', '1000'))/1000)
+            self.template_pool = TemplatePool(self, capacity, workers=int(os.environ.get('E2B_TEMPLATE_POOL_WORKERS', '8')))
 
     def get_public(self, sid):
         with self.lock:
@@ -149,7 +148,7 @@ class VMBackend(CheckpointBackend, Backend):
             time.sleep(.0001)
         with self.lock:
             r.update(host_boot_id=self.boot_id, netns=path, holder_pid=holder.pid, holder_start=self.process_start(holder.pid), holder_inode=expected)
-            self.save()
+            self.save_record(sid)
         return path
 
     def cni_call(self, sid, action):
@@ -201,18 +200,18 @@ class VMBackend(CheckpointBackend, Backend):
                 if r.get('status') == 'deleting':
                     return
                 r.update(network_state='configuring', ip=ip)
-                self.save()
+                self.save_record(sid)
             self.admin('sandbox-network-complete', sandbox_id=sid)
             with self.lock:
                 r = self.get(sid)
                 if r.get('status') != 'deleting':
                     r.update(network_state='ready', network_error='')
-                    self.save()
+                    self.save_record(sid)
         except Exception as error:
             with self.lock:
                 if sid in self.records and self.records[sid].get('status') != 'deleting':
                     self.records[sid].update(network_state='failed', network_error=str(error))
-                    self.save()
+                    self.save_record(sid)
             # Failure belongs to network readiness; the already restored guest
             # remains executable. Do not turn it into a successful Ready response.
 
@@ -265,7 +264,7 @@ class VMBackend(CheckpointBackend, Backend):
                     'expiry': time.time()+timeout, 'metadata': body.get('metadata', {})}
                 self.records[sid].update(getattr(self, 'fixed_image_fields', {}))
                 if parent:
-                    for field in ('template_id', 'exec_root', 'image_manifest', 'image_sha256', 'image_disk', 'oci_config', 'entrypoint_pid', 'slot_disk', 'filesystem_write_backing', 'filesystem_size_mb'):
+                    for field in ('template_id', 'exec_root', 'image_manifest', 'image_sha256', 'image_disk', 'oci_config', 'entrypoint_pid', 'slot_disk', 'filesystem_write_backing', 'filesystem_size_mb', 'remote_template'):
                         if field in self.records[parent]:
                             self.records[sid][field] = self.records[parent][field]
                 if _pool_owned:
@@ -279,11 +278,11 @@ class VMBackend(CheckpointBackend, Backend):
                     if networks:
                         reservation = networks.reserve(sid)
                     if reservation is None:
-                        self.save()
+                        self.save_record(sid)
                 except Exception:
                     self.records[sid]['status'] = 'deleting'
                     try:
-                        self.save()
+                        self.save_record(sid)
                     except Exception:
                         pass
                     raise
@@ -311,7 +310,7 @@ class VMBackend(CheckpointBackend, Backend):
                             if not reused:
                                 with self.lock:
                                     self.get(sid).update(cni_owner=sid, network_slot='net-'+secrets.token_hex(12), network_generation=1)
-                                    self.save()
+                                    self.save_record(sid)
                                 self.cni_call(sid, 'ADD')
                                 if networks:
                                     networks.capture_routes(sid)
@@ -332,7 +331,7 @@ class VMBackend(CheckpointBackend, Backend):
                             vsock_socket=info['live_fork'].get('vsock_socket', str(Path(self.args.sandbox_state)/sid/'task.vsock')))
                         if direct:
                             self.records[sid].update(direct_prepared=True, network_state='ready', ip=ip)
-                        self.save()
+                        self.save_record(sid)
                         trace_timing('running_record', save_ns, sid=sid)
                         if direct:
                             job = concurrent.futures.Future()

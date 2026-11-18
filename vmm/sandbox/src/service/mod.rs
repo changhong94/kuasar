@@ -1432,7 +1432,7 @@ where
             elapsed_us = (now-previous).as_micros() as u64, "POOL_PREPARE_PHASE");
         previous = now;
     };
-    let _transaction = handle.live_fork_lock.lock().await;
+    let transaction = handle.live_fork_lock.lock().await;
     mark("transaction_lock");
     let id = req["sandbox_id"].as_str().ok_or_else(|| anyhow!("missing sandbox_id"))?;
     let source = req["source_id"].as_str().ok_or_else(|| anyhow!("missing source_id"))?;
@@ -1458,6 +1458,13 @@ where
     let slot = handle.sandboxes.read().await.get(id).cloned().unwrap();
     let result = async {
         let mut sandbox = slot.lock().await;
+        // The source configuration is now an owned copy and this new ID is
+        // registered under its per-sandbox lifecycle lock. No source guest
+        // state or disk is forked here. Keep that lock through network/KVM
+        // preparation and durable publication, but let unrelated slots prepare
+        // concurrently. Live-parent fork retains its original transaction gate.
+        drop(transaction);
+        mark("slot_lock_handoff");
         let fresh_identity = req["network_identity"].as_str() == Some("fresh");
         if fresh_identity {
             crate::network::refresh_pool_identity(netns).await?;

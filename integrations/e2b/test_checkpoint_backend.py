@@ -96,3 +96,48 @@ class CheckpointTests(VMBackendTests):
         self.backend.get(self.sid)['status']='resuming'
         with self.assertRaises(APIError) as error: self.backend.pause(self.sid)
         self.assertEqual(error.exception.code,423)
+
+    def test_cold_restart_rebuilds_controller_before_paused_reconciliation(self):
+        from vm_backend import VMBackend
+        self.backend.get(self.sid).update(status='paused', expiry=time.time()-100)
+        self.backend.save()
+        with patch.object(VMBackend, 'admin', return_value=dict(status='paused', controller_missing=True)), \
+             patch.object(VMBackend, 'recover_checkpoint') as recover:
+            restored = VMBackend(self.backend.args)
+        try:
+            recover.assert_called_once_with(self.sid)
+            self.assertEqual(restored.get(self.sid)['status'], 'paused')
+        finally: restored.close()
+
+    def test_failed_cold_recovery_preserves_checkpoint_and_retry_state(self):
+        from vm_backend import VMBackend
+        from pathlib import Path
+        directory=Path(self.backend.args.sandbox_state)/self.sid/'durable-checkpoint'
+        directory.mkdir(parents=True);manifest=directory/'checkpoint.json';manifest.write_text('{}')
+        self.backend.get(self.sid).update(status='paused', expiry=time.time()-100)
+        self.backend.save()
+        with patch.object(VMBackend, 'admin', return_value=dict(status='paused', controller_missing=True)), \
+             patch.object(VMBackend, 'recover_checkpoint', side_effect=RuntimeError('network unavailable')):
+            restored=VMBackend(self.backend.args)
+        try:
+            self.assertEqual(restored.get(self.sid)['status'], 'paused')
+            self.assertTrue(restored.get(self.sid)['checkpoint_recovery_pending'])
+            self.assertTrue(manifest.exists())
+            with patch.object(restored, 'recover_checkpoint', side_effect=RuntimeError('still unavailable')), \
+                 patch.object(restored, 'admin') as admin:
+                with self.assertRaises(RuntimeError):restored.connect(self.sid,{})
+                admin.assert_not_called()
+                self.assertEqual(restored.get(self.sid)['status'], 'paused')
+        finally:restored.close()
+
+    def test_cold_recovery_wrong_ip_never_launches_vm(self):
+        from pathlib import Path
+        directory=Path(self.backend.args.sandbox_state)/self.sid/'durable-checkpoint'
+        directory.mkdir(parents=True)
+        (directory/'checkpoint.json').write_text(json.dumps(dict(version=2,sandbox_id=self.sid,network=dict(intfs=[dict(hwAddr='02:00:00:00:00:01')]))))
+        self.backend.get(self.sid).update(status='paused',ip='10.0.0.2',namespace='kua-'+self.sid)
+        with patch.object(self.backend,'namespace'), patch.object(self.backend,'cni_call'), \
+             patch.object(self.backend,'address',side_effect=['','10.0.0.3']), \
+             patch.object(self.backend,'admin') as admin:
+            with self.assertRaisesRegex(RuntimeError,'checkpoint IP'):self.backend.recover_checkpoint(self.sid)
+            admin.assert_not_called()

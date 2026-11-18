@@ -277,12 +277,13 @@ where
                     let _permit = permit;
                     debug!("recovering sandbox {:?}", entry.file_name());
                     let path = Path::new(&dir_path).join(entry.file_name());
-                    match KuasarSandbox::recover(&path).await {
+                    match KuasarSandbox::<F::VM>::recover(&path).await {
                         Ok(sb) => {
                             let status = sb.status.clone();
+                            let monitorable = sb.vm.pids().vmm_pid.is_some();
                             let sb_mutex = Arc::new(Mutex::new(sb));
                             // Only running sandbox should be monitored.
-                            if let SandboxStatus::Running(_) = status {
+                            if matches!(status, SandboxStatus::Running(_)) && monitorable {
                                 let sb_clone = sb_mutex.clone();
                                 monitor(sb_clone);
                             }
@@ -294,6 +295,10 @@ where
                         }
                         Err(e) => {
                             warn!("failed to recover sandbox {:?}, {:?}", entry.file_name(), e);
+                            if path.join("durable-checkpoint").exists() {
+                                warn!("retaining durable checkpoint for recovery: {:?}", path);
+                                return false;
+                            }
                             cleanup_mounts(path.to_str().unwrap())
                                 .await
                                 .unwrap_or_default();
@@ -1348,6 +1353,22 @@ where
             .map_err(Error::IO)?;
         let mut sb = serde_json::from_slice::<KuasarSandbox<V>>(content.as_slice())
             .map_err(|e| anyhow!("failed to deserialize sandbox, {}", e))?;
+        // A durable checkpoint is authoritative even if every host process
+        // and /run socket disappeared. Never stop a recycled PID or delete it.
+        let checkpoint = base_dir.as_ref().join("durable-checkpoint/checkpoint.json");
+        if checkpoint.exists() && sb.vm.live_fork_profile() {
+            let saved: serde_json::Value = serde_json::from_slice(&tokio::fs::read(&checkpoint).await?)
+                .map_err(|e| anyhow!("invalid checkpoint manifest: {}", e))?;
+            let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
+            let same_boot = saved.get("controller_boot_id").unwrap_or(&saved["boot_id"]).as_str() == Some(boot.trim());
+            if !same_boot || sb.vm.recover().await.is_err() {
+                sb.vm.forget_checkpoint_process();
+                sb.network = None;
+                sb.data.netns.clear();
+                sb.dump().await?;
+            }
+            return Ok(sb);
+        }
         if let SandboxStatus::Running(_) = sb.status {
             if let Err(e) = sb.vm.recover().await {
                 warn!("failed to recover vm {}: {}, then force kill it!", sb.id, e);

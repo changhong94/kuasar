@@ -151,6 +151,10 @@ pub trait VM: Serialize + Sync + Send {
     fn live_fork_info(&self) -> serde_json::Value {
         serde_json::Value::Null
     }
+    fn forget_checkpoint_process(&mut self) {}
+    async fn launch_checkpoint_controller(&mut self, _netns: &str) -> Result<()> {
+        Err(anyhow!("cold checkpoint recovery is unsupported by this backend").into())
+    }
     async fn fork_from(&mut self, _parent: &mut Self) -> Result<u32>
     where
         Self: Sized,

@@ -357,6 +357,7 @@ where
 
     let result = match category {
         "sandbox" => match verb {
+            "checkpoint-recover" => checkpoint::handle(&handle, &req, "recover").await,
             "checkpoint-status" => checkpoint::handle(&handle, &req, "status").await,
             "checkpoint-pause" => checkpoint::handle(&handle, &req, "pause").await,
             "checkpoint-resume" => checkpoint::handle(&handle, &req, "resume").await,

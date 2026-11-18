@@ -20,6 +20,7 @@ from checkpoint_backend import CheckpointBackend
 class VMBackend(CheckpointBackend, Backend):
     def __init__(self, args):
         super().__init__(args)
+        self.boot_id = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
         self.cni = json.loads(Path(args.cni_config).read_text())
         self.plugin = Path(args.cni_bin) / self.cni['type']
         self.jobs = {}
@@ -29,6 +30,10 @@ class VMBackend(CheckpointBackend, Backend):
         self.closed = threading.Event()
         self.template_pool = None
         for sid, record in list(self.records.items()):
+            if record.get('host_boot_id') not in (None, self.boot_id):
+                record['netns'] = ''
+                for field in ('holder_pid', 'holder_start', 'holder_inode'):
+                    record.pop(field, None)
             if record.get('backend') != 'vm':
                 raise ValueError('state file belongs to a different backend')
             if record.get('pool_state') in ('preparing', 'ready', 'binding', 'quarantined'):
@@ -38,6 +43,8 @@ class VMBackend(CheckpointBackend, Backend):
             try:
                 if record.get('status') in ('paused', 'pausing', 'resuming'):
                     checkpoint = self.admin('sandbox-checkpoint-status', sandbox_id=sid)
+                    if checkpoint.get('controller_missing'):
+                        self.recover_checkpoint(sid)
                     record['status'] = checkpoint['status']
                     if record['status'] == 'resuming':
                         self.admin('sandbox-checkpoint-resume', sandbox_id=sid)
@@ -56,7 +63,10 @@ class VMBackend(CheckpointBackend, Backend):
                 else:
                     self.jobs[sid] = self.pool.submit(self.provision, sid)
             except Exception as error:
-                record.update(status='failed', network_state='failed', network_error=str(error))
+                checkpoint_exists = (Path(args.sandbox_state)/sid/'durable-checkpoint/checkpoint.json').exists()
+                record.update(status='paused' if checkpoint_exists else 'failed',
+                              checkpoint_recovery_pending=checkpoint_exists,
+                              network_state='failed', network_error=str(error))
         with self.lock:
             self.save()
         if os.environ.get('E2B_PREPARE_EXEC_CACHE') == '1':
@@ -128,7 +138,7 @@ class VMBackend(CheckpointBackend, Backend):
                 raise RuntimeError('namespace holder failed')
             time.sleep(.0001)
         with self.lock:
-            r.update(netns=path, holder_pid=holder.pid, holder_start=self.process_start(holder.pid), holder_inode=expected)
+            r.update(host_boot_id=self.boot_id, netns=path, holder_pid=holder.pid, holder_start=self.process_start(holder.pid), holder_inode=expected)
             self.save()
         return path
 
@@ -145,6 +155,8 @@ class VMBackend(CheckpointBackend, Backend):
             raise RuntimeError('owned network namespace is missing')
         env = {**os.environ, 'CNI_COMMAND': action, 'CNI_CONTAINERID': sid,
                'CNI_NETNS': ns, 'CNI_IFNAME': 'eth0', 'CNI_PATH': self.args.cni_bin}
+        if action == 'ADD' and r.get('checkpoint_ip'):
+            env['CNI_ARGS'] = 'IgnoreUnknown=1;IP='+r['checkpoint_ip']
         p = subprocess.run([str(self.plugin)], input=json.dumps(self.cni), text=True,
                            capture_output=True, env=env, timeout=30)
         if p.returncode:
@@ -234,7 +246,7 @@ class VMBackend(CheckpointBackend, Backend):
             sid = 'e2b-'+secrets.token_hex(12)
             with self.lock:
                 self.operations[sid] = threading.RLock()
-                self.records[sid] = {'backend': 'vm', 'status': 'creating', 'network_state': 'pending',
+                self.records[sid] = {'backend': 'vm', 'host_boot_id': self.boot_id, 'status': 'creating', 'network_state': 'pending',
                     'namespace': 'kua-'+sid, 'uid': sid, 'token': secrets.token_urlsafe(32),
                     'startedAt': datetime.datetime.now(datetime.timezone.utc).isoformat(),
                     'expiry': time.time()+timeout, 'metadata': body.get('metadata', {})}

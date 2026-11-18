@@ -194,6 +194,12 @@ impl CloudHypervisorVM {
     /// pidfds work for a forked VMM that is NOT a child of the sandboxer. They
     /// also prevent accidentally signaling a recycled PID after parent exit.
     pub(super) async fn monitor_pidfd(&mut self, pid: u32) -> Result<()> {
+        let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?.trim().to_string();
+        if self.process_boot_id.as_ref().is_some_and(|saved| saved != &boot) {
+            return Err(anyhow!("VMM belongs to a previous host boot; refusing PID adoption").into());
+        }
+        self.process_boot_id = Some(boot);
+
         // SAFETY: pidfd_open has scalar arguments; successful fd ownership is
         // transferred exactly once to OwnedFd below.
         let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };

@@ -1,0 +1,64 @@
+{
+  "host": "10.213.17.113",
+  "physical_host_rebooted": false,
+  "physical_host_boot_id_unchanged": true,
+  "validation_environment": "isolated nested KVM Linux host; real guest sandboxes inside it",
+  "cycles": [
+    {
+      "name": "reboot1",
+      "type": "Linux systemctl reboot",
+      "before_boot": "3624172d-5704-4eb4-9aad-be5376d83f4a",
+      "after_boot": "5975c924-d1de-4b69-a253-6836b9d852c5",
+      "success": true,
+      "destroy_order": [
+        0,
+        1
+      ],
+      "post_restore_independent_writes": true
+    },
+    {
+      "name": "reboot2",
+      "type": "forced QMP reset",
+      "before_boot": "5975c924-d1de-4b69-a253-6836b9d852c5",
+      "after_boot": "0666c806-499f-469c-90ff-e02f8c4d5793",
+      "success": true,
+      "destroy_order": [
+        1,
+        0
+      ],
+      "post_restore_independent_writes": true
+    },
+    {
+      "name": "reboot3",
+      "type": "Linux systemctl reboot",
+      "before_boot": "0666c806-499f-469c-90ff-e02f8c4d5793",
+      "after_boot": "5887d258-500f-438c-ac4c-274a2ebaaac8",
+      "success": true,
+      "destroy_order": [
+        1,
+        0
+      ],
+      "post_restore_independent_writes": true
+    }
+  ],
+  "fork_after_reboot": true,
+  "restored_controller_exit_monitored": true,
+  "python_tests": {
+    "total": 108,
+    "passed": 101,
+    "skipped": 7,
+    "failures": 0
+  },
+  "sqlite_fix_commit": "8e058388b4cb2d55b3bf4d67281a18c6ad40fd00",
+  "recovery_scope": "successfully persisted paused version 2 checkpoints; no recovery of uncheckpointed running RAM",
+  "nested_host_configuration": {
+    "vcpus": 4,
+    "ram_mib": 16384,
+    "root_gib": 24,
+    "persistent_data_gib": 64,
+    "disk_cache": "none",
+    "kernel": "6.6.0-72.0.0.76.r1361_99.hce3.lf.x86_64+"
+  },
+  "sandboxer_sha256": "07bcdb5c5ca932f4e5b861c9776075af9c1177a1c351ec508311162427033068",
+  "deployed_113_sandboxer_sha256": "07bcdb5c5ca932f4e5b861c9776075af9c1177a1c351ec508311162427033068"
+}

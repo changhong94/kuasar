@@ -44,12 +44,61 @@ where F: VMFactory + Sync + Send + 'static,
     let directory = Path::new(&sb.base_dir).join("durable-checkpoint");
     let started = std::time::Instant::now();
     if mode == "status" {
+        if sb.vm.pids().vmm_pid.is_none() && directory.join("checkpoint.json").exists() {
+            return Ok(json!({"ok":true,"status":"paused","controller_missing":true}));
+        }
         let running = info(&api).await?.is_some_and(|v| v["state"] == "Running");
         let state = match (directory.join("checkpoint.json").exists(), running) {
             (true, true) => "resuming", (true, false) => "paused",
             (false, true) => "running", (false, false) => "failed",
         };
         return Ok(json!({"ok":true,"status":state}));
+    }
+    if mode == "recover" {
+        if !directory.join("checkpoint.json").exists() {
+            return Err(anyhow!("cold recovery requires a durable checkpoint"));
+        }
+        if sb.vm.pids().vmm_pid.is_none() {
+            let netns = req["netns"].as_str().ok_or_else(|| anyhow!("missing recovery namespace"))?;
+            let recovered = async {
+            sb.vm.launch_checkpoint_controller(netns).await?;
+            sb.data.netns = netns.to_string();
+            sb.prepare_network().await?;
+            sb.network.as_ref().unwrap().fork_block(true).await?;
+            // A previously staged restore is tied to the previous host. Preserve
+            // the immutable checkpoint; stage a new disk generation on resume.
+            let previous = directory.join("restore.json");
+            if previous.exists() { tokio::fs::remove_file(previous).await?; }
+            let marker = directory.join("cold-network.json");
+            tokio::fs::write(&marker, serde_json::to_vec(&sb.vm.live_fork_info()["net"])?).await?;
+            std::fs::File::open(&marker)?.sync_all()?;
+            let mut manifest: Value = serde_json::from_slice(&tokio::fs::read(directory.join("checkpoint.json")).await?)?;
+            manifest["controller_boot_id"] = json!(std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?.trim());
+            let next = directory.join("controller.pending");
+            tokio::fs::write(&next, serde_json::to_vec(&manifest)?).await?;
+            std::fs::File::open(&next)?.sync_all()?;
+            tokio::fs::rename(next, directory.join("checkpoint.json")).await?;
+            std::fs::File::open(&directory)?.sync_all()?;
+            let pid = sb.vm.pids().vmm_pid.ok_or_else(|| anyhow!("recovered controller has no PID"))?;
+            sb.status = SandboxStatus::Running(pid);
+            sb.dump().await?;
+            Ok::<_,anyhow::Error>(())
+            }.await;
+            if let Err(error) = recovered {
+                // Only the newly adopted pidfd can be signalled here. Keep the
+                // immutable checkpoint and owned namespace available for retry.
+                sb.vm.stop(true).await?;
+                sb.vm.forget_checkpoint_process();
+                sb.network = None;
+                sb.data.netns.clear();
+                sb.dump().await?;
+                return Err(error);
+            }
+            // Startup skipped monitoring while the old host PID was invalid.
+            // Register the newly created controller with the normal lifecycle.
+            monitor(sandbox.clone());
+        }
+        return Ok(json!({"ok":true,"status":"paused","live_fork":sb.vm.live_fork_info()}));
     }
     if mode == "resume" {
         if !directory.exists() && info(&api).await?.is_some_and(|v| v["state"] == "Running") {
@@ -70,6 +119,17 @@ where F: VMFactory + Sync + Send + 'static,
             tokio::fs::create_dir(&work).await?;
             std::fs::set_permissions(&work, std::fs::Permissions::from_mode(0o700))?;
             let mut config: Value = serde_json::from_slice(&tokio::fs::read(directory.join("config.json")).await?)?;
+            let cold_network = directory.join("cold-network.json");
+            if cold_network.exists() {
+                let net: Value = serde_json::from_slice(&tokio::fs::read(cold_network).await?)?;
+                // The guest can change its runtime MAC after device creation.
+                // Preserve the snapshotted device config/state, and validate the
+                // restored host endpoint against the saved runtime identity.
+                if net["mac"] != manifest["network"]["intfs"][0]["hwAddr"] {
+                    return Err(anyhow!("recovery network identity differs from checkpoint"));
+                }
+                config["net"][0]["tap"] = net["tap"].clone();
+            }
             let owned = super::disk_checkpoint::stage(&mut config,
                 &Path::new(&sb.base_dir).join("fork-disks"),
                 &format!("checkpoint-{}",uuid::Uuid::new_v4())).await?;
@@ -94,7 +154,12 @@ where F: VMFactory + Sync + Send + 'static,
         }
         let client = crate::client::new_snapshot_sandbox_client(&sb.vm.socket_address()).await?;
         *sb.client.lock().await = Some(client);
-        sb.fork_agent_control(token, true).await?;
+        if directory.join("cold-network.json").exists() {
+            let old: crate::network::Network = serde_json::from_value(manifest["network"].clone())?;
+            sb.fork_agent_release_network(token, Some(&old), None).await?;
+        } else {
+            sb.fork_agent_control(token, true).await?;
+        }
         sb.forward_events().await;
         sb.network.as_ref().ok_or_else(|| anyhow!("missing network"))?.fork_block(false).await?;
         sb.dump().await?;
@@ -149,7 +214,8 @@ where F: VMFactory + Sync + Send + 'static,
         let mut config: Value=serde_json::from_slice(&tokio::fs::read(pending.join("config.json")).await?)?;
         super::disk_checkpoint::capture(&mut config,&pending,&directory).await?;
         tokio::fs::write(pending.join("config.json"),serde_json::to_vec(&config)?).await?;
-        let manifest=json!({"version":1,"sandbox_id":id,"token":token});
+        let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
+        let manifest=json!({"version":2,"sandbox_id":id,"token":token,"boot_id":boot.trim(),"network":sb.network});
         tokio::fs::write(pending.join("checkpoint.json"),serde_json::to_vec(&manifest)?).await?;
         let durable=pending.clone();
         tokio::task::spawn_blocking(move || sync_tree(&durable)).await??;

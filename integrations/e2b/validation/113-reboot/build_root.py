@@ -1,0 +1,33 @@
+from pathlib import Path
+import subprocess as sp,os,shutil
+B=Path('/home/hong/src/research/fork-features-113/nested');R=B/'root';R.mkdir(exist_ok=True)
+def run(*args):sp.run(list(map(str,args)),check=True)
+assert not (B/'root.raw').exists()
+run('truncate','-s','24G',B/'root.raw');run('mkfs.ext4','-q','-F',B/'root.raw');run('mount','-o','loop',B/'root.raw',R)
+try:
+ run('rsync','-a','--exclude=local','--exclude=src','/usr/',str(R/'usr')+'/')
+ for name,target in [('bin','usr/bin'),('sbin','usr/sbin'),('lib','usr/lib'),('lib64','usr/lib64')]:os.symlink(target,R/name)
+ for name in ['etc/ssh','etc/systemd/system/multi-user.target.wants','etc/systemd/network','etc/sysconfig','root/.ssh','run','proc','sys','dev','tmp','var/lib','var/log','home/hong']: (R/name).mkdir(parents=True,exist_ok=True)
+ (R/'tmp').chmod(0o1777);(R/'root/.ssh').chmod(0o700)
+ for name in ['os-release','ld.so.conf','ld.so.conf.d','nsswitch.conf','crypto-policies','localtime']:
+  src=Path('/etc')/name
+  if src.is_dir():shutil.copytree(src,R/'etc'/name,symlinks=True,dirs_exist_ok=True)
+  elif src.exists():shutil.copyfile(src,R/'etc'/name)
+ (R/'etc/passwd').write_text('root:x:0:0:root:/root:/bin/bash\nsshd:x:74:74:sshd:/var/empty/sshd:/sbin/nologin\n')
+ (R/'etc/group').write_text('root:x:0:\nsshd:x:74:\n')
+ (R/'etc/shadow').write_text('root::20000:0:99999:7:::\nsshd:!:20000:0:99999:7:::\n');(R/'etc/shadow').chmod(0o600)
+ (R/'var/run').symlink_to('/run')
+ (R/'etc/hosts').write_text('127.0.0.1 localhost\n::1 localhost\n')
+ (R/'etc/hostname').write_text('fork-reboot-test\n');(R/'etc/machine-id').touch()
+ (R/'etc/resolv.conf').write_text('nameserver 10.0.2.3\n')
+ (R/'etc/fstab').write_text('/dev/vda / ext4 defaults 0 1\n/dev/vdb /home/hong/src/research/python-latest-113/data xfs defaults 0 0\n')
+ shutil.copyfile(B/'id_ed25519.pub',R/'root/.ssh/authorized_keys');(R/'root/.ssh/authorized_keys').chmod(0o600)
+ (R/'etc/ssh/sshd_config').write_text('Port 22\nListenAddress 0.0.0.0\nPermitRootLogin prohibit-password\nPasswordAuthentication no\nUsePAM no\nSubsystem sftp internal-sftp\n')
+ run('ssh-keygen','-A','-f',R)
+ (R/'etc/systemd/system/nested-network.service').write_text('[Unit]\nBefore=sshd.service\n[Service]\nType=oneshot\nExecStart=/bin/sh -ec "ip link set eth0 up; ip addr add 10.0.2.15/24 dev eth0; ip route add default via 10.0.2.2; modprobe kvm_intel; ip netns attach py113-fork 1"\nRemainAfterExit=yes\n[Install]\nWantedBy=multi-user.target\n')
+ (R/'etc/systemd/system/sshd.service').write_text('[Unit]\nAfter=nested-network.service\nRequires=nested-network.service\n[Service]\nExecStart=/usr/sbin/sshd -D -e\nRestart=on-failure\n[Install]\nWantedBy=multi-user.target\n')
+ for unit in ['sshd.service','nested-network.service']:os.symlink('../'+unit,R/'etc/systemd/system/multi-user.target.wants'/unit)
+ os.symlink('/usr/lib/systemd/system/multi-user.target',R/'etc/systemd/system/default.target')
+ run('chroot',R,'ldconfig')
+finally:run('umount',R)
+run('truncate','-s','64G',B/'data.raw');run('mkfs.xfs','-f','-m','reflink=1',B/'data.raw')

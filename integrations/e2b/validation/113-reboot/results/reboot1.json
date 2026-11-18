@@ -1,0 +1,51 @@
+{
+  "before_boot": "3624172d-5704-4eb4-9aad-be5376d83f4a",
+  "sandboxes": [
+    {
+      "id": "e2b-d3e65e80d1627668fe7ef192",
+      "file": "afbbfe9065c14beb934ac21a1a259f53",
+      "memory": {
+        "secret": "a2dc44522f0ca1d5c13a48dbf17c646ea192829e8685fb72",
+        "nonce": "02c68546da004775bf8cf2b80f15ebc0",
+        "counter": 2,
+        "pid": 169
+      },
+      "paused": true,
+      "after_memory": {
+        "secret": "a2dc44522f0ca1d5c13a48dbf17c646ea192829e8685fb72",
+        "nonce": "92ccb6f8973d4fc398b2e0001d7a8bde",
+        "counter": 3,
+        "pid": 169
+      },
+      "file_verified": true,
+      "destroyed": true
+    },
+    {
+      "id": "e2b-27688ee3ae2c4146e836e4be",
+      "file": "eb8d4085c1e8412d892ae05e47df75c6",
+      "memory": {
+        "secret": "a2dc44522f0ca1d5c13a48dbf17c646ea192829e8685fb72",
+        "nonce": "66dddc1774f24cd2b64f0090f26f88e3",
+        "counter": 2,
+        "pid": 169
+      },
+      "paused": true,
+      "after_memory": {
+        "secret": "a2dc44522f0ca1d5c13a48dbf17c646ea192829e8685fb72",
+        "nonce": "af3a974f9b6c45cd85a67f8da5b49b46",
+        "counter": 3,
+        "pid": 169
+      },
+      "file_verified": true,
+      "destroyed": true
+    }
+  ],
+  "ready_for_host_reboot": true,
+  "after_boot": "5975c924-d1de-4b69-a253-6836b9d852c5",
+  "post_restore_independent_writes": true,
+  "success": true,
+  "destroy_order": [
+    0,
+    1
+  ]
+}

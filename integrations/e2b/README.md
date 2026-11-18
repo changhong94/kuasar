@@ -96,11 +96,31 @@ writable application disk is supported. Guest RAM may contain dirty filesystem
 pages; restoring the matching RAM and disk checkpoint preserves that state.
 
 Scope: E2B direct-VM guests with no containerd container metadata. This is not
-CRI Pod checkpointing. Adapter recovery can reconcile an interrupted transition
-while the VMM controller survives; host reboot/controller-loss recovery is not
-yet provided. Successful guest fsync and VMM-crash tests do not constitute a
-host power-loss certification. Pausing consumes durable snapshot capacity and
-is not a constant-time operation.
+CRI Pod checkpointing. Version 2 checkpoints support recovery after a host boot
+change or loss of the paused VMM controller. Persist the sandbox state, SQLite
+DB plus its WAL/journal, image templates, writable bases and CNI IPAM state on
+mounted durable filesystems before starting the sandboxer/adapter. Recreate the
+adapter's own network namespace before starting it when deployment uses one.
+The boot supervisor must reconcile its private seed lease; the isolated Linux
+host fixture under `validation/113-reboot` demonstrates these dependencies.
+
+Pause each sandbox and wait for successful acknowledgment **before rebooting**.
+Startup retains durable checkpoints, rejects prior-boot PIDs, rebuilds private
+namespaces/TAPs/controllers, and keeps sandboxes paused. SDK `connect()` restores
+the saved processes, RAM and file state under their original sandbox identity.
+The CNI plugin must restore the saved IP; failure preserves the checkpoint and
+blocks resume for retry. The VMM's saved device MAC and the guest/CNI runtime MAC
+are distinct identities; device state is preserved while the host endpoint is
+checked against the saved runtime network. Stale TCP state is reset before the
+host network gate opens. New controllers rejoin normal lifecycle monitoring.
+
+This restores the last successfully persisted **paused** state. It does not
+save uncheckpointed running RAM on arbitrary power loss or continuously persist
+changes after resume. Version 1 checkpoints lack the boot/identity metadata for
+cold recovery; create a version 2 checkpoint before an upgrade/reboot test.
+Pausing consumes durable snapshot capacity and is not a constant-time operation.
+The tests include a nested Linux kernel reboot and forced reset; this is not a
+physical-device power-loss certification.
 
 ---
 

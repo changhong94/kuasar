@@ -105,6 +105,8 @@ pub struct CloudHypervisorVM {
     #[serde(default)]
     pid_start_time: Option<u64>,
     #[serde(default)]
+    process_boot_id: Option<String>,
+    #[serde(default)]
     fork_operation: Option<serde_json::Value>,
     #[serde(default)]
     fork_parent: Option<String>,
@@ -162,6 +164,7 @@ impl CloudHypervisorVM {
                 .then(|| vm_config.common.image_path.clone()),
             fork_cid: None,
             pid_start_time: None,
+            process_boot_id: None,
             fork_operation: None,
             fork_parent: None,
             fork_source_api: None,
@@ -257,7 +260,48 @@ impl VM for CloudHypervisorVM {
         serde_json::json!({"profile": if self.fork_cid.is_some() { "vsock-agent" } else { "serial-only" }, "serial_socket": self.fork_serial_path(),
             "api_socket": self.config.api_socket, "parent_id": self.fork_parent,
             "operation": self.fork_operation, "pid": self.pids.vmm_pid,
-            "guest_agent": self.fork_cid.is_some(), "cid": self.fork_cid, "vsock_socket": self.vsock_path()})
+            "guest_agent": self.fork_cid.is_some(), "cid": self.fork_cid, "net": self.fork_net, "vsock_socket": self.vsock_path()})
+    }
+    fn forget_checkpoint_process(&mut self) {
+        self.pids = Pids::default();
+        self.pidfd = None;
+        self.pid_start_time = None;
+        self.process_boot_id = None;
+        self.wait_chan = None;
+        self.client = None;
+        self.fork_parent = None;
+        self.fork_source_api = None;
+        self.fork_operation = None;
+        self.fork_previous_operations.clear();
+        self.fork_net = None;
+        self.devices.clear();
+        self.fds.clear();
+        self.netns.clear();
+    }
+    async fn launch_checkpoint_controller(&mut self, netns: &str) -> Result<()> {
+        if !self.live_fork || self.pids.vmm_pid.is_some() {
+            return Err(anyhow!("checkpoint controller is not absent").into());
+        }
+        self.netns = netns.to_string();
+        let runtime = self.fork_runtime_dir.as_deref().unwrap_or(&self.base_dir);
+        create_dir_all(runtime).await?;
+        for name in [&self.config.api_socket, &self.vsock_path(), &self.fork_serial_path()] {
+            match tokio::fs::remove_file(name).await {
+                Ok(()) => (),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+                Err(e) => return Err(e.into()),
+            }
+        }
+        let mut cmd = tokio::process::Command::new(&self.config.path);
+        cmd.arg("--api-socket").arg(&self.config.api_socket).arg("--enable-fork");
+        set_cmd_netns(&mut cmd, netns.to_string())?;
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let child = cmd.spawn()?;
+        let pid = child.id().ok_or_else(|| anyhow!("missing checkpoint controller PID"))?;
+        spawn_wait(child, format!("checkpoint-controller {}", self.id), None, None);
+        self.monitor_pidfd(pid).await?;
+        self.client = Some(self.create_client().await?);
+        Ok(())
     }
     async fn fork_from(&mut self, parent: &mut Self) -> Result<u32> {
         self.fork_live_vm(parent).await

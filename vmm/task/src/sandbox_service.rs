@@ -302,6 +302,29 @@ impl api::sandbox_ttrpc::SandboxService for SandboxService {
         Ok(Empty::new())
     }
 
+    async fn start_oci_process(
+        &self,
+        _ctx: &TtrpcContext,
+        req: ExecVMProcessRequest,
+    ) -> TtrpcResult<ExecVMProcessResponse> {
+        // Keep the same freeze barrier until the application exec handshake.
+        // The prepared worker owns/reaps the child after this RPC returns.
+        let exec_guard = self.tcp_template.exec_gate.clone().try_read_owned()
+            .map_err(|_| ttrpc::Error::Others("template workload is frozen".into()))?;
+        // Transport cancellation or a deadline must not release the freeze gate
+        // while the single-threaded launcher can still exec the application.
+        // A detached task retains it until the worker's exec acknowledgement.
+        let running = FinishOciLaunch {
+            pending: Some(Box::pin(async move {
+                let _exec_guard = exec_guard;
+                start_prepared_oci(&req).await
+            })),
+        };
+        tokio::time::timeout(Duration::from_secs(15), running).await
+            .map_err(|_| Error::Other("Prepared OCI launch timed out; launch gate retained".into()))?
+            .map_err(Into::into)
+    }
+
     async fn exec_vm_process(
         &self,
         _ctx: &TtrpcContext,
@@ -1107,6 +1130,92 @@ fn process_command(command: &str, argv: &[String]) -> Result<std::process::Comma
     let mut cmd = std::process::Command::new(&argv[0]);
     cmd.args(&argv[1..]);
     Ok(cmd)
+}
+
+// Poll on the RPC task for the normal path. Only cancellation transfers the
+// unfinished handshake (and its execution gate) to a background task.
+struct FinishOciLaunch {
+    pending: Option<std::pin::Pin<Box<
+        dyn std::future::Future<Output = Result<ExecVMProcessResponse>> + Send
+    >>>,
+}
+
+impl std::future::Future for FinishOciLaunch {
+    type Output = Result<ExecVMProcessResponse>;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let this = self.get_mut();
+        let result = this.pending.as_mut().expect("launch polled after completion")
+            .as_mut().poll(cx);
+        if result.is_ready() {
+            this.pending = None;
+        }
+        result
+    }
+}
+
+impl Drop for FinishOciLaunch {
+    fn drop(&mut self) {
+        if let Some(pending) = self.pending.take() {
+            tokio::spawn(async move { let _ = pending.await; });
+        }
+    }
+}
+
+async fn start_prepared_oci(req: &ExecVMProcessRequest) -> Result<ExecVMProcessResponse> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let contract = ["/usr/bin/oci-launch", "start", "/run/image-root", "/run/oci-entrypoint"];
+    if !req.command.is_empty() || !req.stdin.is_empty() || req.argv.len() < 9
+        || !req.argv.iter().take(4).map(String::as_str).eq(contract)
+        || req.argv.iter().any(|s| s.as_bytes().contains(&0))
+    {
+        return Err(Error::Other("Invalid prepared OCI launch request".into()));
+    }
+    let mut payload = Vec::new();
+    for arg in &req.argv {
+        payload.extend_from_slice(arg.as_bytes());
+        payload.push(0);
+    }
+    if payload.len() > 16 * 1024 * 1024 {
+        return Err(Error::Other("Prepared OCI launch request too large".into()));
+    }
+    let started = std::time::Instant::now();
+    let handshake = async {
+        let mut stream = tokio::net::UnixStream::connect("/run/oci-launch.sock").await?;
+        stream.write_all(&(payload.len() as u32).to_be_bytes()).await?;
+        stream.write_all(&payload).await?;
+        let mut answer = [0u8; 8];
+        stream.read_exact(&mut answer).await?;
+        Ok::<_, std::io::Error>(answer)
+    };
+    let answer = handshake.await
+        .map_err(|e| Error::Other(format!("Prepared OCI launch failed: {e}")))?;
+    let pid = u32::from_be_bytes(answer[..4].try_into().unwrap());
+    let error = i32::from_be_bytes(answer[4..].try_into().unwrap());
+    let mut response = ExecVMProcessResponse::new();
+    response.structured_output = true;
+    response.pid = pid;
+    if error != 0 {
+        response.exit_code = 126;
+        response.stderr = format!("OCI exec failed: {}", std::io::Error::from_raw_os_error(error));
+    } else if pid == 0 {
+        return Err(Error::Other("Prepared OCI worker returned an invalid PID".into()));
+    } else {
+        response.out = format!("{pid}\n");
+    }
+    if req.profile {
+        let timing = crate::util::ProcessTiming {
+            pid,
+            total_us: started.elapsed().as_micros(),
+            ..Default::default()
+        };
+        response.timing_json = serde_json::to_string(&timing)
+            .map_err(|e| Error::Other(e.to_string()))?;
+    }
+    Ok(response)
 }
 
 async fn execute_result(

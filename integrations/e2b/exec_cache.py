@@ -1,14 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Image-independent metadata preparation. Never execute or preload application files."""
+"""Uniform, bounded image-tree preparation. Never execute applications."""
 import json
 from pathlib import Path
 import time
 import vm_rpc
 
-def prepare_metadata(socket, root):
-    """Walk metadata uniformly; never read regular-file contents or execute applications."""
+MAX_READ_BYTES = 512 * 1024 * 1024
+
+
+def prepare_metadata(socket, root, read_limit=0):
+    """Use one policy for every image; zero disables content reads."""
+    if not isinstance(read_limit, int) or not 0 <= read_limit <= MAX_READ_BYTES:
+        raise ValueError("Uniform image read cache must be between 0 and 512 MiB")
     started = time.perf_counter_ns()
-    result = vm_rpc.execute(Path(socket), ['/usr/bin/image-metadata', root, '0'])
+    result = vm_rpc.execute(Path(socket), ['/usr/bin/image-metadata', root, str(read_limit)])
     if result['exit_code']:
         raise RuntimeError('image metadata preparation failed')
     report = json.loads(result['stdout'])

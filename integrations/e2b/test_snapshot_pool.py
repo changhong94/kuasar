@@ -66,3 +66,21 @@ class SnapshotPoolTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'entrypoint failed'): b.create({})
         self.assertTrue(before - set(b.records))
         self.assertFalse(any(r.get('pool_state')=='leased' for r in b.committed.values()))
+
+    def test_prepared_worker_failure_keeps_lease_private(self):
+        b = self.backend
+        def start(path, argv, **kwargs):
+            self.assertEqual(kwargs, {'method': 'StartOCIProcess'})
+            pending = [sid for sid, r in b.records.items() if r.get('pool_state') == 'binding']
+            self.assertEqual(len(pending), 1)
+            with self.assertRaises(APIError):
+                b.get_public(pending[0])
+            return {'exit_code': 126, 'stderr': b'exec failed'}
+        with patch.dict(os.environ, E2B_SNAPSHOT_POOL='1'), \
+             patch.object(b, 'prepare_snapshot', return_value=dict(key='template', fields={
+                 'oci_config': b.image_catalog['base']['oci_config'], 'prepared_oci': True})), \
+             patch.object(b, 'admin', return_value={'ok': True}), \
+             patch('image_pool.vm_rpc.execute', side_effect=start):
+            with self.assertRaisesRegex(RuntimeError, 'OCI entrypoint failed'):
+                b.create({})
+        self.assertFalse(any(r.get('pool_state') == 'leased' for r in b.committed.values()))

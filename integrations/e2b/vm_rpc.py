@@ -72,12 +72,12 @@ def exact(sock, n):
         out.extend(chunk)
     return bytes(out)
 
-def execute(path, argv, stdin=b'', timeout=60):
+def execute(path, argv, stdin=b'', timeout=60, *, method='ExecVMProcess'):
     started_ns = time.perf_counter_ns()
     payload = b''.join(blob(3, a) for a in argv) + blob(2, stdin) + integer(5, 1)
     if os.environ.get('E2B_TRACE_TIMING'):
         payload += integer(4, 1)
-    request = blob(1, 'grpc.SandboxService') + blob(2, 'ExecVMProcess') + blob(3, payload) + integer(4, int(timeout*1e9))
+    request = blob(1, 'grpc.SandboxService') + blob(2, method) + blob(3, payload) + integer(4, int(timeout*1e9))
     if len(request) > LIMIT:
         raise ValueError('guest RPC request exceeds 16 MiB')
     with socket.socket(socket.AF_UNIX) as sock:

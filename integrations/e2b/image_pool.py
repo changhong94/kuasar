@@ -87,8 +87,11 @@ class ImagePoolBackend(VMBackend):
         validation_ms = (time.monotonic()-started)*1000
         if os.environ.get('E2B_FIXED_IMAGE'):
             raise ValueError('Fixed-image pools are unsupported; import an OCI image instead')
-        if int(os.environ.get('E2B_TEMPLATE_READ_CACHE_BYTES', '0')):
-            raise ValueError('Application-file preloading is unsupported')
+        self.image_read_cache_bytes = int(os.environ.get('E2B_TEMPLATE_READ_CACHE_BYTES', '0'))
+        if not 0 <= self.image_read_cache_bytes <= exec_cache.MAX_READ_BYTES:
+            raise ValueError('Uniform image read cache must be between 0 and 512 MiB')
+        if self.image_read_cache_bytes and os.environ.get('E2B_TEMPLATE_METADATA', '1') != '1':
+            raise ValueError('Uniform image read cache requires metadata preparation')
         self.slot_disks = None
         if os.environ.get("E2B_PREPARE_IMAGE_DEVICE") == "1":
             from slot_disk import SlotDisks
@@ -114,7 +117,10 @@ class ImagePoolBackend(VMBackend):
 
     def start_entrypoint(self, sid, record):
         # Called while the slot is private and its operation guard is held.
-        result = vm_rpc.execute(record['vsock_socket'], launch_argv(record['oci_config'], start=True))
+        started = time.perf_counter_ns()
+        kwargs = {'method': 'StartOCIProcess'} if record.get('prepared_oci') else {}
+        result = vm_rpc.execute(record['vsock_socket'], launch_argv(record['oci_config'], start=True), **kwargs)
+        trace_timing('oci_entrypoint_start', started, sid=sid, guest=result.get('timing'))
         if result['exit_code']:
             raise RuntimeError('OCI entrypoint failed: '+result.get('stderr', b'').decode(errors='replace'))
         record['entrypoint_pid'] = int(result['stdout'].strip())
@@ -129,14 +135,23 @@ class ImagePoolBackend(VMBackend):
             sid = response['sandboxID']
             try:
                 info = self.admin('sandbox-get', sandbox_id=sid)['live_fork']
+                # Capture an idle trusted launcher, not an application process.
+                runtime_started = time.perf_counter_ns()
+                runtime = vm_rpc.execute(info['vsock_socket'], ['/usr/bin/oci-launch', 'prepare'])
+                if runtime['exit_code']:
+                    raise RuntimeError('OCI worker preparation failed')
+                runtime_preparation_ms = (time.perf_counter_ns()-runtime_started)/1e6
                 # Templates contain mounted filesystems and runtime state only.
-                # No application entrypoint, interpreter, or selected-file reads.
-                metadata_cache = (exec_cache.prepare_metadata(info['vsock_socket'], '/run/image-root')
+                # No entrypoint or interpreter runs; any file cache is uniform
+                # across the image tree under the same global byte budget.
+                metadata_cache = (exec_cache.prepare_metadata(info['vsock_socket'], '/run/image-root',
+                                  self.image_read_cache_bytes)
                                   if os.environ.get('E2B_TEMPLATE_METADATA', '1') == '1' else None)
                 key = 'image-' + uuid.uuid4().hex
                 saved = self.admin('sandbox-snapshot-capture', sandbox_id=sid, template=key)
                 record = self.get(sid)
-                fields = {k: record[k] for k in ('exec_root', 'oci_config', 'entrypoint_pid', 'filesystem_write_backing', 'filesystem_size_mb') if k in record}
+                record['prepared_oci'] = True
+                fields = {k: record[k] for k in ('exec_root', 'oci_config', 'entrypoint_pid', 'filesystem_write_backing', 'filesystem_size_mb', 'prepared_oci') if k in record}
 
                 warm = time.monotonic()
                 memory = Path(saved['directory']) / 'memory-ranges'
@@ -145,7 +160,7 @@ class ImagePoolBackend(VMBackend):
                     while f.read(1024*1024):
                         pass
                 entry = dict(key=key, fields=fields, directory=saved['directory'],
-                             application_started=False, metadata_cache=metadata_cache,
+                             application_started=False, runtime_preparation_ms=runtime_preparation_ms, metadata_cache=metadata_cache,
                              preparation_ms=(warm-started)*1000,
                              warmup_ms=(time.monotonic()-warm)*1000,
                              memory_bytes=memory.stat().st_size,

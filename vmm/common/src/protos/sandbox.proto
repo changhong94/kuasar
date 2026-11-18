@@ -31,6 +31,7 @@ service SandboxService {
 
     // vm
     rpc Check (CheckRequest) returns (google.protobuf.Empty);
+    rpc StartOCIProcess (ExecVMProcessRequest) returns (ExecVMProcessResponse);
     rpc ExecVMProcess (ExecVMProcessRequest) returns (ExecVMProcessResponse);
     rpc ExecVMProcessStreaming (ExecVMProcessRequest) returns (stream ExecVMProcessEvent);
     rpc SyncClock (SyncClockPacket) returns (SyncClockPacket);

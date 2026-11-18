@@ -427,9 +427,14 @@ fork path. Changing template ID in that request is rejected. Existing fork safet
 barriers, filesystem synchronization and durable assignment commits are retained.
 No `memory.img` or eager RAM copy is added. Network identities remain independent.
 Pool exhaustion returns an error after the existing bounded wait rather than
-silently returning the bare runtime. `E2B_FIXED_IMAGE`, nonzero
-`E2B_TEMPLATE_READ_CACHE_BYTES`, and image-specific `startup_read_files` are
-rejected. There are no executable/library pre-read lists.
+silently returning the bare runtime. E2B_FIXED_IMAGE and image-specific
+startup_read_files are rejected. There are no executable/library pre-read lists.
+E2B_TEMPLATE_READ_CACHE_BYTES optionally applies the same 0–512 MiB regular-file
+read budget to every image tree during template preparation; zero (the default)
+only walks metadata. This requires E2B_TEMPLATE_METADATA=1. No language or path
+list selects files, no interpreter executes, symlinks and non-regular files are
+skipped, and reads stay on the root filesystem. Report actual bytes, elapsed
+preparation time and cache/resource costs separately from request latency.
 
 ## OCI import and application startup
 
@@ -531,13 +536,13 @@ Explicit live-parent forks continue to inherit the running state and keep a
 reference to the immutable bound disk until the last descendant is destroyed.
 Do not modify these backing files outside this lifecycle.
 
-The static helper also provides a command launcher, preserving the requested
-cwd, literal environment values, argv and login shell while removing shell
-trampolines. Bounded read-only launch-file hints run after image binding inside
-the measured request; missing optional files do not restrict the image, and no
-user command or login profile is run during preparation. Disk readiness and
-image-independent code loading are pool preparation costs; image binding,
-fsync, cache invalidation, mounts and command execution remain request costs.
+The OCI launcher preserves the requested cwd, literal environment values, argv,
+user and login shell. No user command or login profile runs during preparation,
+and there are no language-specific launch-file hints. Disk readiness and
+image-independent code loading are pool preparation costs. The direct image-bind
+path still performs binding, fsync, cache invalidation, mounts and command
+execution inside the request; the file-template path below separately accounts
+for filesystem preparation and its optional uniform file cache.
 
 
 ### Measured storage variants on host 108
@@ -566,8 +571,10 @@ persistent directory. This is a same-host, same-runtime-profile facility for
 read-only application disks; it does not change explicit live-parent fork.
 
 The adapter materializes each image once in a temporary builder sandbox. It
-mounts the image and optionally walks filesystem metadata with a zero file-read
-limit. It does **not** run ENTRYPOINT/CMD, an interpreter, or application code.
+mounts the image and optionally walks filesystem metadata. The file-read limit
+defaults to zero; E2B_TEMPLATE_READ_CACHE_BYTES can enable uniform, bounded reads
+of regular files for every image, with actual bytes and preparation time recorded.
+It does **not** run ENTRYPOINT/CMD, an interpreter, or application code.
 It then asks
 `sandbox-snapshot-capture` to freeze the guest agent, pause the VM, save CPU,
 device and memory state, and take independently owned disk copies (reflinks
@@ -793,3 +800,51 @@ identity barriers. WAL/SHM sidecars remain part of crash recovery.
 
 Background checkpointing remains opt-in: the measured comparison did not establish
 a consistent advantage over parallel preparation with automatic checkpointing.
+
+### Prepared OCI launcher and readiness
+
+File templates include an idle, single-threaded OCI supervisor and a launcher
+child blocked on a private pipe. Preparation opens runtime logs and creates that
+launcher child, but does not chroot into the application image, resolve its user,
+read its files or execute ENTRYPOINT/CMD. The optional uniform image cache is a
+separate preparation step. VM slots remain image-independent. The launcher PID
+exists in the template; the application executable starts only after the request.
+
+After identity release, the adapter calls `StartOCIProcess` while the lease is
+private. The agent takes the same execution/freeze gate as normal exec. The
+supervisor sends the validated OCI argv to its waiting child, which resolves
+USER/GROUP, ENV and WORKDIR and calls exec. The reply requires the close-on-exec
+handshake; a failed exec cannot publish the sandbox. Client cancellation or the
+RPC deadline leaves the gate owned by the launch task until this handshake
+finishes. Failed leases are quarantined and destroyed by the adapter.
+
+The supervisor reaps the application and retains the fsync/rename/fsync protocol
+for its exit status. Running-parent fork inherits the existing application and
+supervisor rather than starting ENTRYPOINT again. Non-snapshot creation keeps the
+legacy launcher. Deploy the matching guest agent and launcher, then rebuild file
+templates; old templates do not advertise `prepared_oci` and use the legacy RPC.
+
+`oci_entrypoint_start` reports request-time startup. Snapshot preparation records
+`runtime_preparation_ms` separately. API-ready means the application exec handshake
+and durable publication have completed. Benchmark `native_ready_ms` additionally
+includes the first command's shell marker; interpreter-print additionally includes
+interpreter startup and its random marker. None of these three endpoints are
+interchangeable. Do not compare an old template containing an already-running
+ENTRYPOINT to fresh application startup without identifying that difference.
+
+Native worker tests must run in a private PID/mount namespace (PID 1), with
+`OCI_WORKER_TEST_BINARY` and `OCI_WORKER_TEST_PROBE` set. The probe is a statically
+linked fixture that reports uid/gid/cwd/environment/groups and exits with code 7.
+
+The runtime preparation timer is included in template preparation, not an
+additional cost to sum. Reproduce the isolated native tests from the repository:
+
+```sh
+test_dir=$(mktemp -d)
+gcc -O2 -static -o "$test_dir/oci-launch" integrations/e2b/oci-launch.c
+gcc -O2 -static -o "$test_dir/probe" integrations/e2b/testdata/oci-worker-probe.c
+sudo unshare --mount --pid --fork --mount-proc env \
+  OCI_WORKER_TEST_BINARY="$test_dir/oci-launch" \
+  OCI_WORKER_TEST_PROBE="$test_dir/probe" \
+  python3 integrations/e2b/test_oci_worker.py -v
+```

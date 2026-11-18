@@ -127,8 +127,10 @@ pub fn reset() -> io::Result<()> {
         seq += 1;
         match request(&socket, seq, DESTROY, family, Some(&id), CONNECTED) {
             Ok(_) => (),
-            // Same tolerances as iproute2: disappeared or unkillable socket.
-            Err(e) if matches!(e.raw_os_error(), Some(libc::ENOENT | libc::EOPNOTSUPP)) => (),
+            // A disappeared socket is already gone. Unsupported destruction must
+            // fail closed: an inherited live connection cannot cross identity
+            // release merely because this kernel lacks INET_DIAG_DESTROY.
+            Err(e) if e.raw_os_error() == Some(libc::ENOENT) => (),
             Err(e) => return Err(e),
         }
     }
@@ -146,7 +148,7 @@ mod tests {
     use super::*;
     #[test]
     #[ignore = "destroys TCP connections; run only under unshare --net"]
-    fn reset_connections_preserves_listeners() {
+    fn reset_connections_preserves_listeners_or_rejects_unsupported_kernel() {
         assert_ne!(
             std::fs::read_link("/proc/self/ns/net").unwrap(),
             std::fs::read_link("/proc/1/ns/net").unwrap(),
@@ -170,7 +172,15 @@ mod tests {
                 (client, server)
             })
             .collect();
-        reset().unwrap();
+        match reset() {
+            Err(error) if error.raw_os_error() == Some(libc::EOPNOTSUPP) => {
+                // This host cannot validate successful destruction. It must
+                // report failure so ForkControl cannot release either barrier.
+                eprintln!("kernel lacks TCP destruction; reset correctly failed closed");
+                return;
+            }
+            result => result.unwrap(),
+        }
         for (a, b) in &mut pairs {
             for s in [a, b] {
                 s.set_read_timeout(Some(Duration::from_secs(1))).unwrap();

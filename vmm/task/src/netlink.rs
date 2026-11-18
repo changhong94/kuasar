@@ -85,14 +85,14 @@ impl Handle {
         old_mac: &str,
         intfs: Vec<Interface>,
     ) -> Result<()> {
-        let link = self.find_fork_interface(old_mac, &intfs).await?;
+        let link = self.find_fork_interface(old_mac, &intfs, false).await?;
         self.apply_fork_interface(intfs, link).await
     }
 
     // Read-only resolution may overlap entropy/TCP cleanup while the fork gate
     // and host network gate remain closed. Mutation still follows cleanup.
     pub(crate) async fn find_fork_interface(
-        &self, old_mac: &str, intfs: &[Interface],
+        &self, old_mac: &str, intfs: &[Interface], certified_template: bool,
     ) -> Result<Link> {
         if intfs.len() != 1 {
             return Err(other!("fork requires one guest NIC"));
@@ -101,7 +101,17 @@ impl Handle {
         // lost-response retries retain the old/new-MAC fallback.
         let old = parse_mac_address(old_mac)?;
         let new = parse_mac_address(&intfs[0].hwAddr)?;
-        let named = self.find_link(LinkFilter::Name(&intfs[0].name)).await;
+        // Frozen fixed templates cannot rename/reconfigure the NIC. Read the
+        // small identity tuple synchronously instead of an async netlink round
+        // trip; retain full netlink lookup and MAC fallback for every failure.
+        let named = if certified_template {
+            match fork_link_by_name(&intfs[0].name) {
+                Ok(link) => Ok(link),
+                Err(_) => self.find_link(LinkFilter::Name(&intfs[0].name)).await,
+            }
+        } else {
+            self.find_link(LinkFilter::Name(&intfs[0].name)).await
+        };
         let link = match named {
             Ok(link) if link.attributes.iter().any(|a| matches!(a,
                 LinkAttribute::Address(mac) if mac.as_slice() == old || mac.as_slice() == new)) => link,
@@ -118,6 +128,16 @@ impl Handle {
     ) -> Result<()> {
         if intfs.len() != 1 { return Err(other!("fork requires one guest NIC")); }
         self.update_interface(intfs.into_iter().next().unwrap(), link, true).await
+    }
+
+    pub(crate) async fn apply_fork_routes(
+        &mut self, routes: Vec<Route>, interface_name: String, interface_index: u32,
+    ) -> Result<()> {
+        let old_routes = self.query_routes(None).await?;
+        self.delete_routes(old_routes).await?;
+        let mut indices = HashMap::new();
+        indices.insert(interface_name, interface_index);
+        self.add_routes_with_indices(routes, indices).await
     }
 
     pub async fn update_interfaces(&mut self, intfs: Vec<Interface>) -> Result<()> {
@@ -339,13 +359,18 @@ impl Handle {
     where
         I: IntoIterator<Item = Route>,
     {
+        self.add_routes_with_indices(list, HashMap::new()).await
+    }
+
+    async fn add_routes_with_indices<I>(&mut self, list: I, mut indices: HashMap<String, u32>) -> Result<()>
+    where I: IntoIterator<Item = Route>,
+    {
         // Split the list so we add routes with no gateway first.
         // Note: `partition_in_place` is a better fit here, since it reorders things inplace (instead of
         // allocating two separate collections), however it's not yet in stable Rust.
         let (a, b): (Vec<Route>, Vec<Route>) = list.into_iter().partition(|p| p.gateway.is_empty());
         let list = a.iter().chain(&b);
 
-        let mut indices = HashMap::new();
         for route in list {
             let index = if let Some(index) = indices.get(&route.device) {
                 *index
@@ -553,7 +578,45 @@ impl From<u32> for VecRouteFlag {
     }
 }
 
-/// Wraps external type with the local one, so we can implement various extensions and type conversions.
+/// Minimal link view for the fork interface setter (index/name/MAC/UP).
+/// This does not replace general netlink dumps. Ownership closes the query FD
+/// on all paths; the final index check rejects a concurrent name reassignment.
+fn fork_link_by_name(name: &str) -> std::io::Result<Link> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::io::{Error, ErrorKind};
+    if name.is_empty() || name.len() >= libc::IFNAMSIZ || name.as_bytes().contains(&0) {
+        return Err(Error::new(ErrorKind::InvalidInput, "invalid NIC name"));
+    }
+    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
+    if fd < 0 { return Err(Error::last_os_error()); }
+    // SAFETY: socket returned a new owned descriptor.
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    let mut req: libc::ifreq = unsafe { std::mem::zeroed() };
+    for (out, byte) in req.ifr_name.iter_mut().zip(name.bytes()) { *out = byte as libc::c_char; }
+    let mut query = |op| -> std::io::Result<libc::ifreq> {
+        // SAFETY: req is a correctly sized, initialized Linux ifreq.
+        if unsafe { libc::ioctl(fd.as_raw_fd(), op, &mut req) } < 0 {
+            Err(Error::last_os_error())
+        } else { Ok(req) }
+    };
+    let index = unsafe { query(libc::SIOCGIFINDEX)?.ifr_ifru.ifru_ifindex };
+    let address = unsafe { query(libc::SIOCGIFHWADDR)?.ifr_ifru.ifru_hwaddr };
+    if index <= 0 || address.sa_family != libc::ARPHRD_ETHER as libc::sa_family_t {
+        return Err(Error::new(ErrorKind::InvalidData, "not an Ethernet NIC"));
+    }
+    let flags = unsafe { query(libc::SIOCGIFFLAGS)?.ifr_ifru.ifru_flags };
+    if unsafe { query(libc::SIOCGIFINDEX)?.ifr_ifru.ifru_ifindex } != index {
+        return Err(Error::new(ErrorKind::InvalidData, "NIC name changed during lookup"));
+    }
+    let mut message = LinkMessage::default();
+    message.header.index = index as u32;
+    if i32::from(flags) & libc::IFF_UP != 0 { message.header.flags.push(LinkFlag::Up); }
+    message.attributes = vec![LinkAttribute::IfName(name.to_owned()),
+        LinkAttribute::Address(address.sa_data[..6].iter().map(|x| *x as u8).collect())];
+    Ok(message.into())
+}
+
+/// Local wrapper for netlink conversions and accessors.
 pub(crate) struct Link(LinkMessage);
 
 impl Link {
@@ -577,7 +640,7 @@ impl Link {
         self.header.flags.contains(&LinkFlag::Up)
     }
 
-    fn index(&self) -> u32 {
+    pub(crate) fn index(&self) -> u32 {
         self.header.index
     }
 }
@@ -689,6 +752,18 @@ fn parse_mac_address(addr: &str) -> Result<[u8; 6]> {
 mod fork_network_tests {
     use super::*;
 
+    #[test]
+    fn fork_lookup_closes_temporary_descriptors() {
+        let count = || std::fs::read_dir("/proc/self/fd").unwrap().count();
+        let before = count();
+        for _ in 0..100 {
+            assert!(fork_link_by_name("missing-fork0").is_err());
+            assert!(fork_link_by_name("").is_err());
+            assert!(fork_link_by_name("lo").is_err()); // non-Ethernet fallback
+        }
+        assert_eq!(count(), before);
+    }
+
     // Run only in an isolated network namespace with CAP_NET_ADMIN.
     #[tokio::test]
     #[ignore = "requires a private network namespace"]
@@ -707,7 +782,9 @@ mod fork_network_tests {
                 IPAddress { address: "fd00::2".into(), mask: "64".into(), ..Default::default() },
             ], ..Default::default()
         };
-        h.reset_fork_interface(old, vec![intf.clone()]).await.unwrap();
+        let fast = h.find_fork_interface(old, &[intf.clone()], true).await.unwrap();
+        assert_eq!(fast.index(), index);
+        h.apply_fork_interface(vec![intf.clone()], fast).await.unwrap();
         let link = h.find_link(LinkFilter::Name("fork-test")).await.unwrap();
         assert_eq!(link.index(), index);
         assert!(link.is_up());
@@ -723,11 +800,24 @@ mod fork_network_tests {
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             }
         }).await.unwrap();
+        // Reuse the validated NIC index for route installation, then verify
+        // the kernel installed the route on precisely that device. Repeat to
+        // cover deletion/reinstallation after a lost response.
+        let route = Route { device: "fork-test".into(), gateway: "198.51.100.1".into(),
+            family: IPFamily::v4.into(), ..Default::default() };
+        for _ in 0..2 {
+            h.apply_fork_routes(vec![route.clone()], "fork-test".into(), index).await.unwrap();
+            assert!(h.query_routes(Some(IpVersion::V4)).await.unwrap().iter().any(|r|
+                r.header.destination_prefix_length == 0 &&
+                r.attributes.contains(&RouteAttribute::Oif(index)) &&
+                r.attributes.contains(&RouteAttribute::Gateway(RouteAddress::Inet("198.51.100.1".parse().unwrap())))));
+        }
         // A retried request still names the old MAC. It must remain idempotent.
         h.reset_fork_interface(old, vec![intf.clone()]).await.unwrap();
         // Preserve the MAC-based fallback when the guest renamed the interface.
         h.handle.link().set(index).name("renamed".into()).execute().await.unwrap();
-        h.reset_fork_interface(old, vec![intf]).await.unwrap();
+        let renamed = h.find_fork_interface(old, &[intf.clone()], true).await.unwrap();
+        h.apply_fork_interface(vec![intf], renamed).await.unwrap();
         assert_eq!(h.find_link(LinkFilter::Name("fork-test")).await.unwrap().index(), index);
     }
 }

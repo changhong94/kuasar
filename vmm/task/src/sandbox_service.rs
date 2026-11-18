@@ -136,37 +136,6 @@ impl api::sandbox_ttrpc::SandboxService for SandboxService {
             // Validate ownership once, and keep both gates closed on any error.
             self.fork_gate.control(&req.token, false).await?;
         }
-        if reset_network {
-            let seed = req.entropy.clone();
-            let queued = std::time::Instant::now();
-            let cleanup = tokio::task::spawn_blocking(move || -> std::io::Result<(u64, u64, u64)> {
-                let queue_us = queued.elapsed().as_micros() as u64;
-                let start = std::time::Instant::now();
-                if !seed.is_empty() { write_entropy_sync(&seed)?; }
-                let entropy_us = start.elapsed().as_micros() as u64;
-                let start = std::time::Instant::now();
-                if let Some(state) = certificate { crate::tcp_template::check_frozen(&state)?; }
-                else { crate::tcp_reset::reset()?; }
-                Ok((queue_us, entropy_us, start.elapsed().as_micros() as u64))
-            });
-            let mut handle = self.handle.lock().await;
-            // join! (not try_join!) drains the blocking job even if lookup fails.
-            // A failed lookup never races later cleanup with a released gate.
-            let (cleaned, link) = tokio::join!(cleanup, handle.find_fork_interface(&req.old_mac, &req.interfaces));
-            let (queue_us, entropy_us, tcp_us) = cleaned
-                .map_err(|e| Error::Other(format!("identity cleanup worker failed: {}", e)))?
-                .map_err(|e| Error::Other(format!("identity cleanup failed: {}", e)))?;
-            let link = link?;
-            mark("cleanup_and_link_lookup");
-            identity_work = Some((queue_us, entropy_us, tcp_us));
-            handle.apply_fork_interface(req.interfaces.clone(), link).await?;
-            mark("interface");
-            handle.update_routes(req.routes.clone()).await?;
-            mark("routes");
-        } else if !req.entropy.is_empty() {
-            write_entropy(&req.entropy).await?;
-            mark("entropy");
-        }
         if req.release {
             // Transport reset can leave old-CID vsock readers asleep in epoll.
             // Wake only registered, already-disconnected sockets; their owners
@@ -176,6 +145,54 @@ impl api::sandbox_ttrpc::SandboxService for SandboxService {
                 .wake_disconnected()
                 .map_err(|e| Error::Other(format!("wake reset RPC transports: {}", e)))?;
             debug!("fork woke {} disconnected RPC transports", count);
+            mark("transport_wake");
+        }
+        if reset_network {
+            let seed = req.entropy.clone();
+            let queued = std::time::Instant::now();
+            let cleanup = async move {
+                if let Some(state) = certificate {
+                    let start = std::time::Instant::now();
+                    crate::tcp_template::check_frozen(&state)
+                        .map_err(|e| Error::Other(format!("frozen certificate: {e}")))?;
+                    let tcp_us = start.elapsed().as_micros() as u64;
+                    let start = std::time::Instant::now();
+                    if !seed.is_empty() {
+                        crate::tcp_template::reseed_frozen(&state, &seed)
+                            .map_err(|e| Error::Other(format!("frozen entropy: {e}")))?;
+                    }
+                    return Ok::<_, Error>((0, start.elapsed().as_micros() as u64, tcp_us));
+                }
+                // Running-parent forks retain the full blocking TCP cleanup.
+                tokio::task::spawn_blocking(move || -> std::io::Result<(u64, u64, u64)> {
+                    let queue_us = queued.elapsed().as_micros() as u64;
+                    let start = std::time::Instant::now();
+                    if !seed.is_empty() { write_entropy_sync(&seed)?; }
+                    let entropy_us = start.elapsed().as_micros() as u64;
+                    let start = std::time::Instant::now();
+                    crate::tcp_reset::reset()?;
+                    Ok((queue_us, entropy_us, start.elapsed().as_micros() as u64))
+                }).await
+                    .map_err(|e| Error::Other(format!("identity cleanup worker failed: {e}")))?
+                    .map_err(|e| Error::Other(format!("identity cleanup failed: {e}")))
+            };
+            let mut handle = self.handle.lock().await;
+            // join! (not try_join!) drains the blocking job even if lookup fails.
+            // A failed lookup never races later cleanup with a released gate.
+            let (cleaned, link) = tokio::join!(cleanup, handle.find_fork_interface(&req.old_mac, &req.interfaces, skip_tcp));
+            let (queue_us, entropy_us, tcp_us) = cleaned?;
+            let link = link?;
+            mark("cleanup_and_link_lookup");
+            identity_work = Some((queue_us, entropy_us, tcp_us));
+            let index = link.index();
+            let name = req.interfaces[0].name.clone();
+            handle.apply_fork_interface(req.interfaces.clone(), link).await?;
+            mark("interface");
+            handle.apply_fork_routes(req.routes.clone(), name, index).await?;
+            mark("routes");
+        } else if !req.entropy.is_empty() {
+            write_entropy(&req.entropy).await?;
+            mark("entropy");
         }
         if req.release {
             self.tcp_template.release(&req.token).await?;

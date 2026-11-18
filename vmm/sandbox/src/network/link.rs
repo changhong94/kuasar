@@ -316,10 +316,35 @@ impl NetworkInterface {
                 let tap_name = format!("tap_kua_{}", self.index);
                 let tap_intf =
                     create_tap_in_netns(netns, &tap_name, self.queue, self.mtu, &handle).await?;
-                tap_intf.add_qdisc_ingress(netns, &handle).await?;
-                self.add_qdisc_ingress(netns, &handle).await?;
-                tap_intf.add_redirect_tc_filter(netns, &self.name).await?;
-                self.add_redirect_tc_filter(netns, &tap_intf.name).await?;
+                if !netns.is_empty() && [&self.name, &tap_intf.name].iter().all(|name|
+                    name.bytes().all(|b| b.is_ascii_alphanumeric() || b"_.:-".contains(&b))) {
+                    // One tc process, still four ordered netlink transactions.
+                    // tc stops on the first failure; publication remains behind
+                    // the caller's network gate and durable identity barrier.
+                    let input = format!(
+                        "qdisc add dev {} ingress\nqdisc add dev {} ingress\n\
+                         filter add dev {} parent ffff: protocol all u32 match u8 0 0 action mirred egress redirect dev {}\n\
+                         filter add dev {} parent ffff: protocol all u32 match u8 0 0 action mirred egress redirect dev {}\n",
+                        tap_intf.name, self.name, tap_intf.name, self.name, self.name, tap_intf.name);
+                    let output = run_in_new_netns(netns, move || -> std::io::Result<std::process::Output> {
+                        use std::io::Write;
+                        use std::process::{Command, Stdio};
+                        let mut child = Command::new("tc").args(["-batch", "-"])
+                            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+                        let write_result = child.stdin.take().unwrap().write_all(input.as_bytes());
+                        let output = child.wait_with_output()?;
+                        write_result?;
+                        Ok(output)
+                    }).await??;
+                    if !output.status.success() {
+                        return Err(anyhow!("TC wiring batch failed: {}", String::from_utf8_lossy(&output.stderr)).into());
+                    }
+                } else {
+                    tap_intf.add_qdisc_ingress(netns, &handle).await?;
+                    self.add_qdisc_ingress(netns, &handle).await?;
+                    tap_intf.add_redirect_tc_filter(netns, &self.name).await?;
+                    self.add_redirect_tc_filter(netns, &tap_intf.name).await?;
+                }
                 self.twin = Some(Box::new(tap_intf));
             }
             LinkType::Physical(bdf, _driver) => {

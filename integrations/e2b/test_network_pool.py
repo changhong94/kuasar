@@ -71,6 +71,7 @@ class NetworkPoolTests(unittest.TestCase):
         def run(args,r=None,**kwargs):
             return SimpleNamespace(stdout=json.dumps(links if args[:4]==['ip','-j','-d','link'] else []))
         with patch.object(self.pool,'owned'),patch.object(self.pool,'run',side_effect=run) as local, \
+             patch('conntrack_netlink.delete_ip',side_effect=OSError(95,'unsupported')), \
              patch('network_pool.subprocess.run',return_value=SimpleNamespace(returncode=0)) as host:
             self.pool.reset(self.record)
         self.assertEqual(host.call_count,2)

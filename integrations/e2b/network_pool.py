@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Owned bridge-network slots. No VM, credentials or guest state is recycled."""
 import ipaddress
+import errno
 import concurrent.futures
 import json
 import os
@@ -39,7 +40,12 @@ class NetworkPool:
 
     def run(self, args, r=None, input=None):
         prefix = ['nsenter', '--net='+r['netns']] if r else []
-        return subprocess.run(prefix+args, input=input, text=True, capture_output=True, timeout=15, check=True)
+        started = time.perf_counter_ns()
+        try:
+            return subprocess.run(prefix+args, input=input, text=True, capture_output=True, timeout=15, check=True)
+        finally:
+            from server import trace_timing
+            trace_timing('network_command', started, command=args[:5], slot=(r or {}).get('network_slot'))
 
     @staticmethod
     def parallel(operations):
@@ -76,6 +82,7 @@ class NetworkPool:
 
     def claim(self, sid):
         b = self.backend
+        started = time.perf_counter_ns()
         with b.lock:
             idle = next(((key, r) for key, r in b.records.items()
                          if r.get('network_only') and r.get('status') == 'network_idle'), None)
@@ -93,6 +100,9 @@ class NetworkPool:
                 b.holders[sid] = b.holders.pop(key)
             b.save()
             copy = dict(r)
+        from server import trace_timing
+        trace_timing('network_claim_commit', started, sid=sid)
+        started = time.perf_counter_ns()
         mac = bytearray(secrets.token_bytes(6)); mac[0] = (mac[0] & 0xfe) | 0x02
         # Drop entries created by late packets during the idle interval too.
         address = ':'.join(f'{x:02x}' for x in mac)
@@ -100,6 +110,7 @@ class NetworkPool:
         # before the caller creates one or publishes the slot.
         self.parallel([lambda: self.clear_host_conntrack(copy),
                        lambda: self.run(['ip', 'link', 'set', 'dev', 'eth0', 'address', address], copy)])
+        trace_timing('network_claim_reset', started, sid=sid)
         return copy['netns']
 
     def reset(self, r):
@@ -129,11 +140,30 @@ class NetworkPool:
         self.parallel(work)
 
     def clear_host_conntrack(self, r):
+        from conntrack_netlink import delete_ip
+        from server import trace_timing
+        started = time.perf_counter_ns()
+        try:
+            delete_ip(r['ip'])
+            return
+        except OSError as error:
+            # Old kernels may reject tuple dump filters; no delete has run in
+            # that case. Preserve the existing scoped CLI path for those hosts.
+            if error.errno not in (errno.EOPNOTSUPP, errno.EINVAL):
+                raise
+        finally:
+            trace_timing('network_conntrack_netlink', started, slot=r.get('network_slot'))
+        self.clear_host_conntrack_cli(r)
+
+    def clear_host_conntrack_cli(self, r):
         # Host bridge conntrack can also contain this slot's flows. Never flush
         # the shared host table: remove only tuples containing the owned IP.
         def delete(selector):
+            started = time.perf_counter_ns()
             result = subprocess.run([self.conntrack, '-D', '-f', 'ipv4', selector, r['ip']],
                                     text=True, capture_output=True, timeout=15)
+            from server import trace_timing
+            trace_timing('network_conntrack_delete', started, selector=selector, slot=r.get('network_slot'))
             if result.returncode and not (result.returncode == 1 and
                     '0 flow entries have been deleted' in result.stderr):
                 raise RuntimeError('owned conntrack cleanup failed: '+result.stderr)

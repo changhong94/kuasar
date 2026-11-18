@@ -1418,7 +1418,16 @@ where
     F: VMFactory + Sync + Send + 'static,
     F::VM: VM + Snapshottable + Sync + Send + 'static,
 {
+    let started = std::time::Instant::now();
+    let mut previous = started;
+    let mut mark = |phase: &str| {
+        let now = std::time::Instant::now();
+        tracing::info!(sandbox_id = ?req["sandbox_id"], phase,
+            elapsed_us = (now-previous).as_micros() as u64, "POOL_PREPARE_PHASE");
+        previous = now;
+    };
     let _transaction = handle.live_fork_lock.lock().await;
+    mark("transaction_lock");
     let id = req["sandbox_id"].as_str().ok_or_else(|| anyhow!("missing sandbox_id"))?;
     let source = req["source_id"].as_str().ok_or_else(|| anyhow!("missing source_id"))?;
     validate_id(id)?;
@@ -1435,22 +1444,28 @@ where
         let api = info["api_socket"].as_str().ok_or_else(|| anyhow!("missing source API"))?;
         crate::cloud_hypervisor::live_fork::request(api, "GET", "vm.info", None).await?["config"].clone()
     };
+    mark("profile_read");
     let netns = req["netns"].as_str().filter(|s| !s.is_empty())
         .ok_or_else(|| anyhow!("direct pool preparation requires a CNI namespace"))?;
     create_sandbox_slot_in_netns(handle, id, netns).await?;
+    mark("create_slot");
     let slot = handle.sandboxes.read().await.get(id).cloned().unwrap();
     let result = async {
         let mut sandbox = slot.lock().await;
         sandbox.prepare_network().await?;
+        mark("network_prepare");
         let network = sandbox.network.as_ref().ok_or_else(|| anyhow!("missing slot network"))?;
         if network.interfaces().len()!=1 { return Err(anyhow!("direct pool requires one NIC")); }
         network.fork_block(true).await?;
+        mark("network_gate");
         let pid = sandbox.vm.prepare_pool_vm(config).await?;
+        mark("kvm_prepare");
         // Running describes the VMM lifecycle here, as for existing prepared
         // slots; the adapter keeps it private until snapshot bind completes.
         sandbox.status = SandboxStatus::Running(pid);
         sandbox.data.task_address = format!("ttrpc+{}", sandbox.vm.socket_address());
         sandbox.dump().await?;
+        mark("identity_dump");
         Ok(json!({"ok":true,"id":id,"live_fork":sandbox.vm.live_fork_info(),"direct_prepared":true}))
     }.await;
     match result {

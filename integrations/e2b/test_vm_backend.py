@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 import concurrent.futures
 import json
+import subprocess
+import sys
 from pathlib import Path
 import tempfile
 import threading
@@ -178,6 +180,103 @@ class VMBackendTests(unittest.TestCase):
             running.result(5)
             self.assertTrue(lock.acquire(blocking=False))
             lock.release()
+
+    def test_holder_exit_wait_reaps_and_accepts_already_reaped_child(self):
+        child = subprocess.Popen([sys.executable, '-c', 'pass'])
+        try:
+            VMBackend.wait_holder(child)
+            self.assertEqual(child.returncode, 0)
+            VMBackend.wait_holder(child)
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.wait()
+
+    def test_delete_missing_vm_still_reclaims_cni(self):
+        actions = []
+        def admin(action, **kwargs):
+            actions.append(action)
+            raise RuntimeError(f'sandbox {self.sid} not found')
+        self.backend.admin = admin
+        self.backend.cni_call = lambda sid, action: actions.append(action)
+        self.backend.destroy(self.sid)
+        self.assertEqual(actions, ['sandbox-destroy', 'DEL'])
+        self.assertNotIn(self.sid, self.backend.records)
+
+    def test_delete_failure_does_not_release_network_or_record(self):
+        actions = []
+        def admin(*args, **kwargs):
+            raise RuntimeError('VM exit timeout; device not found')
+        self.backend.admin = admin
+        self.backend.cni_call = lambda *args: actions.append(args)
+        with self.assertRaisesRegex(RuntimeError, 'VM exit timeout'):
+            self.backend.destroy(self.sid)
+        self.assertEqual(actions, [])
+        self.assertEqual(self.backend.records[self.sid]['status'], 'deleting')
+
+    def test_direct_pool_prepares_empty_kvm_after_cni_without_guest_fork(self):
+        self.backend.direct_pool_prepare = True
+        self.backend.args.source = 'seed'
+        events = []
+        def admin(action, **kw):
+            events.append(action)
+            return {'live_fork': {'pid': 123, 'vsock_socket': 'private-vsock'}}
+        with patch.object(self.backend, 'namespace', return_value='owned-ns'), \
+             patch.object(self.backend, 'cni_call', side_effect=lambda sid, action: events.append(action)), \
+             patch.object(self.backend, 'address', return_value='10.0.0.2'), \
+             patch.object(self.backend, 'admin', side_effect=admin), \
+             patch.object(self.backend, 'provision') as provision:
+            sid = self.backend._create_live({}, _pool_owned=True)
+        self.assertEqual(events, ['ADD', 'sandbox-pool-prepare'])
+        provision.assert_not_called()
+        self.assertTrue(self.backend.jobs[sid].done())
+        self.assertTrue(self.backend.records[sid]['direct_prepared'])
+        self.assertEqual(self.backend.records[sid]['pool_state'], 'preparing')
+        self.assertEqual(self.backend.records[sid]['network_state'], 'ready')
+
+    def test_direct_prepare_failure_retains_normal_cleanup(self):
+        self.backend.direct_pool_prepare = True
+        self.backend.args.source = 'seed'
+        cleaned = []
+        with patch.object(self.backend, 'namespace', return_value='owned-ns'), \
+             patch.object(self.backend, 'cni_call'), \
+             patch.object(self.backend, 'address', return_value='10.0.0.2'), \
+             patch.object(self.backend, 'admin', side_effect=RuntimeError('KVM preparation failed')), \
+             patch.object(self.backend, 'destroy', side_effect=cleaned.append):
+            with self.assertRaisesRegex(RuntimeError, 'KVM preparation failed'):
+                self.backend._create_live({}, _pool_owned=True)
+        self.assertEqual(len(cleaned), 1)
+        self.assertEqual(self.backend.records[cleaned[0]]['pool_state'], 'preparing')
+
+    def test_network_handoff_commit_failure_quarantines_even_after_commit(self):
+        from unittest.mock import Mock
+        from server import APIError
+        self.backend.records[self.sid].update(pool_origin=True, pool_state='leased', direct_prepared=True)
+        idle = dict(backend='vm', network_only=True, network_slot='net-owned',
+                    status='network_idle', pool_state='network_idle', expiry=time.time()+60)
+        self.backend.network_pool = Mock()
+        self.backend.network_pool.retire.return_value = idle
+        self.backend.template_pool = Mock(enabled=True)
+        original = self.backend.save
+        failed = False
+        def save():
+            nonlocal failed
+            original()
+            if 'net-owned' in self.backend.records and not failed:
+                failed = True
+                raise OSError('acknowledgment lost after commit')
+        with patch.object(self.backend, 'save', side_effect=save), \
+             patch.object(self.backend, 'admin', return_value={}), \
+             patch.object(self.backend, 'cni_call') as cni:
+            with self.assertRaises(OSError):self.backend.destroy(self.sid)
+        cni.assert_not_called()
+        self.backend.template_pool.capacity_changed.assert_not_called()
+        self.assertEqual(self.backend.records['net-owned']['status'], 'deleting')
+        self.assertEqual(self.backend.records['net-owned']['pool_state'], 'quarantined')
+        with self.assertRaises(APIError):self.backend.get_public('net-owned')
+        saved=json.loads(self.backend.state.read_text())
+        self.assertEqual(saved['net-owned']['status'], 'deleting')
+        self.assertNotIn(self.sid, saved)
 
 
 class WireTests(unittest.TestCase):

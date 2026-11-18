@@ -259,6 +259,48 @@ impl VM for CloudHypervisorVM {
             "operation": self.fork_operation, "pid": self.pids.vmm_pid,
             "guest_agent": self.fork_cid.is_some(), "cid": self.fork_cid, "vsock_socket": self.vsock_path()})
     }
+    async fn prepare_pool_vm(&mut self, mut config: serde_json::Value) -> Result<u32> {
+        if !self.live_fork || self.fork_cid.is_none() || self.pids.vmm_pid.is_some() {
+            return Err(anyhow!("direct preparation requires an unstarted live-fork agent slot").into());
+        }
+        let net = self.fork_net.as_ref().ok_or_else(|| anyhow!("missing prepared NIC"))?;
+        let old_net = config["net"].as_array_mut().filter(|n| n.len() == 1)
+            .ok_or_else(|| anyhow!("generic profile requires one NIC"))?;
+        for (key, value) in net.as_object().unwrap() {
+            old_net[0][key] = value.clone();
+        }
+        config["vsock"]["cid"] = serde_json::json!(self.fork_cid.unwrap());
+        config["vsock"]["socket"] = serde_json::json!(self.vsock_path());
+        config["serial"] = serde_json::json!({"mode":"Socket", "socket":self.fork_serial_path()});
+        config["console"] = serde_json::json!({"mode":"Off"});
+        // Persist the exact transport/profile binding before publication. This
+        // config has no per-application image and does not instantiate RAM.
+        let path = Path::new(&self.base_dir).join("generic-slot.json");
+        tokio::fs::write(&path, serde_json::to_vec(&config).map_err(anyhow::Error::from)?).await?;
+        std::fs::File::open(&path)?.sync_all()?;
+        std::fs::File::open(&self.base_dir)?.sync_all()?;
+        let mut command = tokio::process::Command::new(&self.config.path);
+        command.args(["--api-socket", &self.config.api_socket, "--enable-fork"]);
+        set_cmd_netns(&mut command, self.netns.clone())?;
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let child = command.spawn()?;
+        let pid = child.id().ok_or_else(|| anyhow!("missing prepared VMM PID"))?;
+        self.pids.vmm_pid = Some(pid);
+        spawn_wait(child, format!("prepared cloud-hypervisor {}", self.id), None, None);
+        self.monitor_pidfd(pid).await?;
+        let deadline = Instant::now()+Duration::from_secs(10);
+        loop {
+            if live_fork::request(&self.config.api_socket, "GET", "vmm.ping", None).await.is_ok() {
+                break;
+            }
+            if Instant::now() >= deadline {
+                return Err(anyhow!("prepared VMM API startup timeout").into());
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        live_fork::request(&self.config.api_socket, "PUT", "vmm.prepare", Some(config)).await?;
+        Ok(pid)
+    }
     async fn fork_from(&mut self, parent: &mut Self) -> Result<u32> {
         self.fork_live_vm(parent).await
     }

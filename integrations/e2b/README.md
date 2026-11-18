@@ -241,8 +241,46 @@ expiry before responding. Ready/preparing/quarantined slots are not accessible
 through sandbox or guest APIs. Capacity includes assigned and retiring members;
 deleting a member opens capacity for serial background refill. Exhaustion waits
 up to 45 seconds and returns 503 if no slot becomes available. The default
-`E2B_TEMPLATE_POOL_REFILL_DELAY_MS=1000` coalesces deletion bursts; report this
-refill delay separately, not as zero-cost capacity. There is no tenant recycling.
+`E2B_TEMPLATE_POOL_REFILL_DELAY_MS=1000` starts when a successful lease consumes
+Ready capacity. Refilling still waits for completed retirement to release owned
+capacity; it does not restart the full delay after deletion. Recovery/retirement
+without a pending lease deadline starts a fresh delay. Report the configured
+delay, actual preparation work and client-observed pool recovery separately.
+There is no tenant recycling. DELETE remains synchronous: it confirms VM exit,
+CNI DEL, namespace cleanup and durable record removal before returning.
+
+Optional `E2B_SLOT_NETWORK_POOL=1` retains network resources for direct file-
+snapshot slots. It requires a single IPv4 `bridge` / `host-local` CNI config,
+no NAT or CNI extensions, and `conntrack` (override with `E2B_CONNTRACK_BIN`).
+Unsupported configurations fail closed when enabled; leave it disabled for the
+ordinary per-sandbox CNI lifecycle. It does not change explicit live-parent forks.
+
+A network slot owns its namespace holder, veth, persistent TAP and CNI allocation.
+Its IP is stable across generations, but each replacement gets a fresh sandbox
+ID, access token, CID and MAC. After confirmed VM exit, old redirects and
+neighbour entries are cleared, and conntrack is flushed
+inside the owned namespace. Host-side deletion selects only that slot's IP;
+it never flushes the host conntrack table. Independent cleanup operations run
+concurrently and are all joined, even on failure, before ownership can move.
+Late entries are cleared again on
+claim. Administrative link state and CNI routes are retained: there is no
+link down/up cycle. Routes are captured in the durable slot record. The new MAC is announced through
+ARP notification. Snapshot identity
+reset and the TAP gate remain prerequisites for forwarding to the new guest.
+Snapshot connection setup verifies a read-only guest `Check` before sending the
+identity mutation. Transport probes may reconnect; identity changes are never
+blindly retried, and the existing overall/identity deadlines remain unchanged.
+
+Retirement removes the old sandbox identity and durably creates a private idle
+network record in one transaction. Claim atomically transfers ownership and
+increments its generation. Failed handoff commits quarantine the resource.
+Idle resources are inaccessible through sandbox APIs, are reclaimed on adapter
+recovery, and are fully removed by pool drain. DELETE remains synchronous for VM
+retirement and network reset; it no longer removes retained pool namespaces.
+Report this separately from asynchronous delete acknowledgment and from draining
+all pool-owned network resources. Reusing an IP is not a promise to reject all
+future unsolicited traffic to that address; old guest processes, sockets and
+connection-tracking state are not transferred to the next generation.
 
 Explicit `/sandboxes/{parent}/fork` always derives the parent's current state;
 it never consumes a template slot. At adapter recovery, private slots are
@@ -517,6 +555,19 @@ can be imported through the normal catalog route; their first use includes
 preparation unless explicitly prepared beforehand. It does not allocate a
 second VM pool. Explicit forks inherit the running process/filesystem state
 through the original live-fork path, rather than restoring an older template.
+
+With file snapshots enabled, generic pool slots use `sandbox-pool-prepare`:
+CNI and a fresh network identity are prepared first, then an API-only VMM calls
+`vmm.prepare` to create KVM/vCPU resources. No temporary guest is booted, forked,
+or deleted, and no application disk is attached to this empty VMM. The durable
+slot configuration retains independent vsock/serial endpoints and MAC; network
+forwarding stays blocked through template restore and identity reset. This path
+requires the matching sandboxer with direct preparation support; failures are
+cleaned up rather than silently falling back to a live guest.
+
+Template capture and explicit running-parent forks keep their existing guest
+and device readiness barriers. Live-memory pools retain their existing device
+preparation path. Capacity and persistence rules are unchanged.
 
 Preparation metrics are in `STATE.snapshot-preparation.json`; refill and total
 replacement latency remain in `STATE.pool-events.jsonl`. Snapshot binding logs

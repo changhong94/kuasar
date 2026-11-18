@@ -237,3 +237,36 @@ class ImagePoolTests(unittest.TestCase):
             self.backend.validate_image_config({})
         with self.assertRaisesRegex(ValueError,'startup reads'):
             self.backend.validate_image_config({'startup_read_files':['/usr/local/bin/python3']})
+
+    def test_only_discarded_snapshot_guest_skips_device_discovery(self):
+        import os
+        from unittest.mock import Mock
+        sid = next(iter(self.backend.records))
+        disks = Mock(path=self.backend.state.parent)
+        self.backend.snapshot_templates = {}
+        with patch.object(self.backend, 'slot_disks', disks, create=True), \
+             patch('image_pool.add_image_disk') as attach, \
+             patch('image_pool.vm_rpc.execute', return_value={'exit_code': 0}) as execute, \
+             patch.dict(os.environ, {'E2B_SNAPSHOT_POOL': '1', 'E2B_IMAGE_MOUNT_HELPER': '/helper'}):
+            self.backend.prepare_slot(sid)
+            attach.assert_called_once()
+            execute.assert_not_called()
+            self.backend.prepare_slot(sid, keep_running=True)
+            execute.assert_called_once_with('test-vsock', ['/helper', 'prepare'])
+            execute.reset_mock()
+            with patch.dict(os.environ, {'E2B_SNAPSHOT_POOL': '0'}):
+                self.backend.prepare_slot(sid)
+            execute.assert_called_once_with('test-vsock', ['/helper', 'prepare'])
+
+    def test_direct_slot_only_stages_metadata_without_guest_or_disk(self):
+        sid = next(iter(self.backend.records))
+        self.backend.records[sid]['direct_prepared'] = True
+        self.backend.snapshot_templates = {'base': {'key': 'generic-test'}}
+        with patch('image_pool.add_image_disk') as attach, \
+             patch('image_pool.vm_rpc.execute') as execute:
+            self.backend.prepare_slot_device(sid)
+            self.backend.prepare_slot(sid, device_prepared=True)
+        attach.assert_not_called()
+        execute.assert_not_called()
+        self.assertEqual(self.backend.calls, [('sandbox-snapshot-stage',
+            {'sandbox_id': sid, 'template': 'generic-test'})])

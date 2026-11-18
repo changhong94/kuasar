@@ -360,6 +360,7 @@ where
             "snapshot-bind" => snapshot_pool::handle(&handle, &req, "bind").await,
             "snapshot-stage" => snapshot_pool::handle(&handle, &req, "stage").await,
             "boot" => handle_live_boot(&handle, &req).await,
+            "pool-prepare" => handle_pool_prepare(&handle, &req).await,
             "fork" => handle_live_fork(&handle, &req).await,
             "fork-prepare" => handle_prepare_fork(&handle, &req).await,
             "network-complete" => handle_complete_network(&handle, &req).await,
@@ -1412,6 +1413,52 @@ where
 /// Used by the `run` action to enable e2e testing of the restore path without a running
 /// containerd/Kubernetes stack.
 /// Cold-boot a VM-only fork seed through the same registered sandbox lifecycle.
+async fn handle_pool_prepare<F>(handle: &Handle<F>, req: &Value) -> anyhow::Result<Value>
+where
+    F: VMFactory + Sync + Send + 'static,
+    F::VM: VM + Snapshottable + Sync + Send + 'static,
+{
+    let _transaction = handle.live_fork_lock.lock().await;
+    let id = req["sandbox_id"].as_str().ok_or_else(|| anyhow!("missing sandbox_id"))?;
+    let source = req["source_id"].as_str().ok_or_else(|| anyhow!("missing source_id"))?;
+    validate_id(id)?;
+    validate_id(source)?;
+    if id == source { return Err(anyhow!("source and slot IDs must differ")); }
+    let parent = handle.sandboxes.read().await.get(source).cloned()
+        .ok_or_else(|| anyhow!("source sandbox not found"))?;
+    let config = {
+        let parent = parent.lock().await;
+        if !parent.vm.live_fork_agent() || !matches!(parent.status, SandboxStatus::Running(_)) {
+            return Err(anyhow!("generic profile source must be a running live-fork agent"));
+        }
+        let info = parent.vm.live_fork_info();
+        let api = info["api_socket"].as_str().ok_or_else(|| anyhow!("missing source API"))?;
+        crate::cloud_hypervisor::live_fork::request(api, "GET", "vm.info", None).await?["config"].clone()
+    };
+    let netns = req["netns"].as_str().filter(|s| !s.is_empty())
+        .ok_or_else(|| anyhow!("direct pool preparation requires a CNI namespace"))?;
+    create_sandbox_slot_in_netns(handle, id, netns).await?;
+    let slot = handle.sandboxes.read().await.get(id).cloned().unwrap();
+    let result = async {
+        let mut sandbox = slot.lock().await;
+        sandbox.prepare_network().await?;
+        let network = sandbox.network.as_ref().ok_or_else(|| anyhow!("missing slot network"))?;
+        if network.interfaces().len()!=1 { return Err(anyhow!("direct pool requires one NIC")); }
+        network.fork_block(true).await?;
+        let pid = sandbox.vm.prepare_pool_vm(config).await?;
+        // Running describes the VMM lifecycle here, as for existing prepared
+        // slots; the adapter keeps it private until snapshot bind completes.
+        sandbox.status = SandboxStatus::Running(pid);
+        sandbox.data.task_address = format!("ttrpc+{}", sandbox.vm.socket_address());
+        sandbox.dump().await?;
+        Ok(json!({"ok":true,"id":id,"live_fork":sandbox.vm.live_fork_info(),"direct_prepared":true}))
+    }.await;
+    match result {
+        Ok(response) => { monitor(slot); Ok(response) }
+        Err(error) => { destroy_sandbox(handle, id).await?; Err(error) }
+    }
+}
+
 async fn handle_live_boot<F>(handle: &Handle<F>, req: &Value) -> anyhow::Result<Value>
 where
     F: VMFactory + Sync + Send + 'static,

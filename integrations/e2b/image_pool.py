@@ -93,6 +93,7 @@ class ImagePoolBackend(VMBackend):
         if os.environ.get("E2B_PREPARE_IMAGE_DEVICE") == "1":
             from slot_disk import SlotDisks
             self.slot_disks = SlotDisks(Path(args.state).parent / "slot-disks", self.image_catalog)
+        self.direct_pool_prepare = os.environ.get('E2B_SNAPSHOT_POOL') == '1'
         self.snapshot_templates = {}
         self.snapshot_lock = threading.RLock()
         super().__init__(args)
@@ -303,7 +304,9 @@ class ImagePoolBackend(VMBackend):
                 raise
 
 
-    def prepare_slot(self, sid, keep_running=False):
+    def prepare_slot_device(self, sid, keep_running=False):
+        if self.get(sid).get('direct_prepared'):
+            return  # No guest or disk backend exists until file snapshot restore.
         if getattr(self, 'slot_disks', None) is None:
             return
         with self.operation(sid):
@@ -314,10 +317,27 @@ class ImagePoolBackend(VMBackend):
             self.slot_disks.create(path)
             info = self.admin('sandbox-get', sandbox_id=sid)['live_fork']
             add_image_disk(info['api_socket'], path)
-            result = vm_rpc.execute(info['vsock_socket'],
-                                    [os.environ['E2B_IMAGE_MOUNT_HELPER'], 'prepare'])
-            if result['exit_code']:
-                raise RuntimeError('Generic block device preparation failed')
+            # File-snapshot slots discard this guest before vmm.prepare. Only
+            # the host disk configuration is needed; waiting for this temporary
+            # guest's device discovery is wasted work. A template builder or a
+            # live-memory slot keeps its guest and still needs that barrier.
+            if keep_running or os.environ.get('E2B_SNAPSHOT_POOL') != '1':
+                result = vm_rpc.execute(info['vsock_socket'],
+                                       [os.environ['E2B_IMAGE_MOUNT_HELPER'], 'prepare'])
+                if result['exit_code']:
+                    raise RuntimeError('Generic block device preparation failed')
+
+    def prepare_slot(self, sid, keep_running=False, device_prepared=False):
+        if self.get(sid).get('direct_prepared'):
+            with self.operation(sid):
+                for entry in list(self.snapshot_templates.values()):
+                    self.admin('sandbox-snapshot-stage', sandbox_id=sid, template=entry['key'])
+            return
+        if getattr(self, 'slot_disks', None) is None:
+            return
+        with self.operation(sid):
+            if not device_prepared:
+                self.prepare_slot_device(sid, keep_running=keep_running)
             if os.environ.get('E2B_SNAPSHOT_POOL') == '1' and not keep_running:
                 self.admin('sandbox-snapshot-prepare', sandbox_id=sid)
                 for entry in list(self.snapshot_templates.values()):
@@ -325,9 +345,11 @@ class ImagePoolBackend(VMBackend):
 
     def destroy(self, sid):
         super().destroy(sid)
+        started = time.perf_counter_ns()
         if getattr(self, 'slot_disks', None) is not None:
             with self.lock:
                 self.slot_disks.collect({r['slot_disk'] for r in self.records.values() if r.get('slot_disk')})
+        trace_timing('delete_disk_collect', started, sid=sid)
 
     def execute_process(self, sid, process, user=None):
         record = self.get_public(sid)

@@ -80,7 +80,18 @@ pub(crate) async fn new_snapshot_sandbox_client(address: &str) -> Result<Sandbox
                 connect_to_socket(address).await
             };
             match result {
-                Ok(fd) => return SandboxServiceClient::new(Client::new(fd)),
+                Ok(fd) => {
+                    let client = SandboxServiceClient::new(Client::new(fd));
+                    // CONNECT acknowledges the transport, not guest readiness.
+                    // TRANSPORT_RESET during resume can invalidate a connection
+                    // accepted before the guest finished resetting its sockets.
+                    // Only retry this read-only probe, never identity mutations.
+                    match client.check(with_timeout(1_000_000_000), &CheckRequest::new()).await {
+                        Ok(_) => return client,
+                        Err(error) => tracing::warn!(%error,
+                            "snapshot agent transport check failed; reconnecting"),
+                    }
+                }
                 Err(error) => tracing::info!(%error, elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
                     "snapshot agent connect retry"),
             }
@@ -509,6 +520,15 @@ mod tests {
 
     #[tokio::test]
     async fn fork_reconnect_replaces_a_reset_connection() {
+        reconnect_replaces_a_reset_connection(false).await;
+    }
+
+    #[tokio::test]
+    async fn snapshot_reconnect_replaces_a_reset_connection() {
+        reconnect_replaces_a_reset_connection(true).await;
+    }
+
+    async fn reconnect_replaces_a_reset_connection(snapshot: bool) {
         use std::{sync::Arc, time::Duration};
 
         use vmm_common::api::{
@@ -545,7 +565,10 @@ mod tests {
         });
         let client = tokio::time::timeout(
             Duration::from_secs(3),
-            super::reconnect_checked_sandbox_client(&address),
+            async {
+                if snapshot { super::new_snapshot_sandbox_client(&address).await }
+                else { super::reconnect_checked_sandbox_client(&address).await }
+            },
         )
         .await
         .unwrap()

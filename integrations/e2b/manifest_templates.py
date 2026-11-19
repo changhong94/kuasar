@@ -43,6 +43,15 @@ class ManifestTemplates:
         directory = Path(directory).resolve(strict=True)
         if directory.parent != self.root:
             raise ValueError('Template is outside the configured root')
+        reference = directory / 'chunk-reference.json'
+        if reference.exists():
+            # Capture already committed payloads and its root index to Store.
+            # Native files here are only the warm/cold local materialization.
+            root = json.loads(reference.read_text())
+            if root.get('version') != 1 or not root.get('manifest'):
+                raise ValueError('Invalid captured Manifest reference')
+            return dict(version=1, source=str(directory), files=root['files'],
+                        root_manifest=root['manifest'], publication_ms=0)
         started = time.monotonic()
         entries = []
         for path in sorted(directory.iterdir()):

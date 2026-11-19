@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 from server import APIError
-from image_pool import ImagePoolBackend
+from image_pool import ImagePoolBackend, warm_sparse_memory
 from test_template_pool import FakeBackend
 from template_pool import TemplatePool
 
@@ -29,6 +29,24 @@ class FakeImages(ImagePoolBackend, FakeBackend):
 
 
 class ImagePoolTests(unittest.TestCase):
+    def test_sparse_ram_warming_skips_holes(self):
+        import os
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp)/'ram'
+            with path.open('wb') as f:
+                f.write(b'a'*4096)
+                f.seek(64*1024*1024)
+                f.write(b'b'*4096)
+                f.flush()
+                os.fsync(f.fileno())
+            read = warm_sparse_memory(path)
+            self.assertGreaterEqual(read, 8192)
+            self.assertLess(read, path.stat().st_size//2)
+            with path.open('rb') as f:
+                self.assertEqual(f.read(4096),b'a'*4096)
+                f.seek(64*1024*1024)
+                self.assertEqual(f.read(),b'b'*4096)
+
     def test_metadata_staging_withdraws_ready_slots_without_creating_vms(self):
         original = set(self.backend.records)
         created = self.backend.created

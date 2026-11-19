@@ -2600,6 +2600,9 @@ impl<'de> Deserialize<'de> for MemoryRestoreMode {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SnapshotConfig {
+    /// Internal policy populated from the top-level `[checkpoint]` section.
+    #[serde(skip)]
+    pub checkpoint_mode: crate::config::CheckpointMode,
     /// Enable Environment (bare VM) snapshot restore instead of cold-booting each sandbox.
     /// Safe to enable after validating that the hypervisor restore process works end-to-end.
     pub enable_environment_restore: bool,
@@ -2626,6 +2629,7 @@ const DEFAULT_MAX_CONCURRENT_RESTORES: usize = 4;
 impl Default for SnapshotConfig {
     fn default() -> Self {
         Self {
+            checkpoint_mode: crate::config::CheckpointMode::Remote,
             enable_environment_restore: false,
             enable_warmfork_restore: false,
             enable_continuation_restore: false,

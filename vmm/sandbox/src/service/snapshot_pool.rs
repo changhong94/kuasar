@@ -88,11 +88,24 @@ where
         .ok_or_else(|| anyhow!("missing sandbox_id"))?;
     validate_id(id)?;
     let capture = mode == "capture";
-    let directory = if mode == "prepare" {
+    let mut directory = if mode == "prepare" {
         PathBuf::new()
     } else {
         template_path(req)?
     };
+    let store = super::checkpoint_store::Store::configured()?;
+    if capture && store.is_none() {
+        return Err(anyhow!("snapshot capture requires the configured Manifest store"));
+    }
+    if !capture && mode != "prepare" && directory.join("chunk-reference.json").exists() {
+        let root: Value = serde_json::from_slice(&tokio::fs::read(directory.join("chunk-reference.json")).await?)?;
+        let complete = root["files"].as_array().is_some_and(|files| files.iter()
+            .all(|f| f["name"].as_str().is_some_and(|n| directory.join(n).is_file())));
+        if !complete {
+            directory = store.as_ref().ok_or_else(|| anyhow!("template cache miss requires Manifest store"))?
+                .materialize(&directory, &root).await?;
+        }
+    }
     let sandbox = handle
         .sandboxes
         .read()
@@ -163,6 +176,7 @@ where
             Ok(verified) => verified,
             Err(error) => {
                 let _ = sandbox.fork_agent_control(&token, true).await;
+                let _ = tokio::fs::remove_dir_all(&directory).await;
                 return Err(error.into());
             }
         };
@@ -178,30 +192,6 @@ where
             let mut config: Value =
                 serde_json::from_slice(&tokio::fs::read(directory.join("config.json")).await?)?;
             super::disk_checkpoint::capture(&mut config, &directory, &directory).await?;
-            for (n, disk) in config["disks"]
-                .as_array_mut()
-                .unwrap()
-                .iter_mut()
-                .enumerate()
-            {
-                if disk["readonly"] != true { continue; }
-                let target = directory.join(format!("disk-{n}.raw"));
-                // A reflink is independently owned even when the preparation sandbox is destroyed.
-                let status = tokio::process::Command::new("cp")
-                    .args(["--reflink=auto", "--"])
-                    .arg(
-                        disk["path"]
-                            .as_str()
-                            .ok_or_else(|| anyhow!("missing disk path"))?,
-                    )
-                    .arg(&target)
-                    .status()
-                    .await?;
-                if !status.success() {
-                    return Err(anyhow!("template disk reflink failed"));
-                }
-                disk["path"] = json!(target);
-            }
             tokio::fs::write(directory.join("config.json"), serde_json::to_vec(&config)?).await?;
             let manifest = json!({"version":1,"token":token,"network":sandbox.network,"tcp_empty_verified":tcp_empty_verified});
             tokio::fs::write(
@@ -217,12 +207,24 @@ where
             )
             .await?;
             std::fs::File::open(&directory)?.sync_all()?;
+            let root = store.as_ref().unwrap().publish(&directory).await?;
+            store.as_ref().unwrap().sparsify_memory(&directory, &root).await?;
+            let reference = directory.join("chunk-reference.pending");
+            tokio::fs::write(&reference,serde_json::to_vec(&root)?).await?;
+            std::fs::File::open(&reference)?.sync_all()?;
+            tokio::fs::rename(reference,directory.join("chunk-reference.json")).await?;
+            std::fs::File::open(&directory)?.sync_all()?;
             Ok::<_, anyhow::Error>(())
         }
         .await;
         // A failed snapshot must still release the source's execution barrier.
         let resumed = request(&api, "PUT", "vm.resume", None).await;
         let released = sandbox.fork_agent_control(&token, true).await;
+        if result.is_err() {
+            // An unsuccessful capture must not leave a native-only template
+            // that a later bind could mistake for a committed snapshot.
+            tokio::fs::remove_dir_all(&directory).await?;
+        }
         result?;
         resumed?;
         released?;
@@ -236,10 +238,7 @@ where
         if mode == "stage" && !prepared {
             return Err(anyhow!("metadata staging requires a prepared generic slot"));
         }
-        let key = directory
-            .file_name()
-            .ok_or_else(|| anyhow!("missing template key"))?
-            .to_string_lossy();
+        let key = req["template"].as_str().ok_or_else(|| anyhow!("missing template key"))?;
         let prepared_identity =
             prepared && std::env::var("KUASAR_PREPARED_IDENTITY").as_deref() == Ok("1");
         let work = if prepared_identity {
@@ -326,7 +325,8 @@ where
             }
             super::disk_checkpoint::stage(&mut config,
                 &Path::new(&sandbox.base_dir).join("fork-disks"),
-                &format!("image-{}", uuid::Uuid::new_v4())).await?;
+                &format!("image-{}", uuid::Uuid::new_v4()),
+                sandbox.vm.pids().vmm_pid.ok_or_else(|| anyhow!("missing restore controller"))?).await?;
             mark("stage_parse_patch");
             tokio::fs::write(work.join("state.json"), serde_json::to_vec(&state)?).await?;
             mark("stage_write_state");

@@ -66,6 +66,33 @@ done
 '''
 
 
+def warm_sparse_memory(path):
+    """Warm actual RAM data extents without instantiating cache for holes."""
+    import errno
+    read_bytes = 0
+    with Path(path).open('rb') as f:
+        size = os.fstat(f.fileno()).st_size
+        offset = 0
+        while offset < size:
+            try:
+                start = os.lseek(f.fileno(), offset, os.SEEK_DATA)
+                end = min(os.lseek(f.fileno(), start, os.SEEK_HOLE), size)
+            except OSError as error:
+                if error.errno == errno.ENXIO:
+                    break
+                if error.errno not in (errno.EINVAL, errno.ENOTSUP):
+                    raise
+                start, end = offset, size
+            f.seek(start)
+            while f.tell() < end:
+                data = f.read(min(1024 * 1024, end - f.tell()))
+                if not data:
+                    raise IOError('RAM cache truncated during preparation')
+                read_bytes += len(data)
+            offset = end
+    return read_bytes
+
+
 class ImagePoolBackend(VMBackend):
     def __init__(self, args):
         started = time.monotonic()
@@ -162,14 +189,12 @@ class ImagePoolBackend(VMBackend):
                 warm = time.monotonic()
                 memory = Path(saved['directory']) / 'memory-ranges'
                 # Populate shared host cache once; restore itself uses MAP_PRIVATE.
-                with memory.open('rb') as f:
-                    while f.read(1024*1024):
-                        pass
+                warmed_bytes = warm_sparse_memory(memory)
                 entry = dict(key=key, fields=fields, directory=saved['directory'],
                              application_started=False, runtime_preparation_ms=runtime_preparation_ms, metadata_cache=metadata_cache,
                              preparation_ms=(warm-started)*1000,
                              warmup_ms=(time.monotonic()-warm)*1000,
-                             memory_bytes=memory.stat().st_size,
+                             memory_bytes=memory.stat().st_size, host_warm_read_bytes=warmed_bytes,
                              allocated_bytes=memory.stat().st_blocks*512)
                 if getattr(self, "manifest_templates", None):
                     entry["manifest_descriptor"] = self.manifest_templates.publish(saved["directory"])

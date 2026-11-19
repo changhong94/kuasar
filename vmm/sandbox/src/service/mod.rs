@@ -152,7 +152,9 @@ limitations under the License.
 //! ```
 
 mod snapshot_pool;
+mod memory_maintenance;
 mod checkpoint;
+mod checkpoint_store;
 mod disk_checkpoint;
 
 use std::{
@@ -236,6 +238,7 @@ where
 
     /// Run the admin server, accepting connections until the process exits.
     pub async fn serve(self) {
+        memory_maintenance::start();
         // Remove stale socket from a previous run.
         let _ = tokio::fs::remove_file(&self.sock_path).await;
 
@@ -1654,6 +1657,7 @@ where
     F::VM: VM + Snapshottable + Sync + Send + 'static,
 {
     let request_started = std::time::Instant::now();
+    let _memory_transaction = memory_maintenance::transaction().await?;
     let _transaction = handle.live_fork_lock.lock().await;
     let source = req["source_id"]
         .as_str()
@@ -1725,6 +1729,7 @@ where
             child.prepared_fork.take();
         }
         child.inherit_fork_metadata(&parent).await?;
+        memory_maintenance::inherit(std::path::Path::new(&parent.base_dir), std::path::Path::new(&child.base_dir))?;
         let deferred = req["defer_network"].as_bool().unwrap_or(false);
         if parent
             .network
@@ -2026,6 +2031,7 @@ where
     F: VMFactory + Sync + Send + 'static,
     F::VM: VM + Snapshottable + Sync + Send + 'static,
 {
+    let _memory_transaction = memory_maintenance::transaction().await?;
     let sandbox_mutex = handle
         .sandboxes
         .read()
@@ -2076,6 +2082,8 @@ where
             return Err(anyhow!("remove sandbox dir {}: {}", base_dir, e).into());
         }
     }
+
+    memory_maintenance::start();
 
     if let (Some(tid), Some(pool)) = (consumed_template_id, handle.pool.as_ref()) {
         match template_snapshot_type.as_ref() {

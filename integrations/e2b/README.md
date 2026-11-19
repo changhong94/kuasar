@@ -906,12 +906,26 @@ sudo unshare --mount --pid --fork --mount-proc env \
 
 ## Manifest-backed snapshot creation
 
-Set `E2B_MANIFEST_RAW` to the accelerator `manifest-raw` binary and
-`E2B_MANIFEST_CONFIG` to a private Manifest configuration file. Existing native
-image templates are published through the existing chunking, compression,
-encryption and deduplication pipeline during preparation. Request restoration
-with `snapshotMode: "manifest"` on HTTP create, or SDK metadata
-`{"kuasar.snapshot.mode": "manifest"}`. Native creation remains the default.
+Template capture now requires the sandboxer's `KUASAR_CHECKPOINT_MANIFEST_RAW`
+and `KUASAR_CHECKPOINT_MANIFEST_CONFIG` settings described below. Capture commits
+RAM, device state, disks and a root index through the existing chunking,
+compression, encryption and deduplication pipeline before returning success.
+`chunk-reference.json` holds the root Manifest key; `manifest.json` remains VM
+identity metadata, not the chunk-store Manifest.
+
+Native template files are a disposable local cache. After publication the RAM
+cache is reconstructed from Manifest runs, keeping zero/hole runs sparse;
+preparation warms only data extents. If native files are absent, template binding
+reconstructs them from the root Manifest. Reconstruction costs count toward that
+request, not an earlier preparation phase. Per-image file templates do not create
+per-image VM reserve pools.
+
+Set the adapter's `E2B_MANIFEST_RAW` and `E2B_MANIFEST_CONFIG` to the same backend
+when requesting explicit fresh materialization with `snapshotMode: "manifest"`
+on HTTP create, or SDK metadata `{"kuasar.snapshot.mode": "manifest"}`.
+Local cache reuse remains the default create mode; persistence itself is no
+longer optional. The adapter reuses the capture's published keys rather than
+uploading a second copy.
 
 This initial backend eagerly reconstructs the entire sparse template into a
 private directory before VM binding. It verifies fetched content and syncs files
@@ -936,3 +950,132 @@ its newly persisted record, so startup fills any remaining vacancy in a later
 wave instead of assuming each submitted job created a slot. Each slot still
 requires successful device/network readiness and a durable Ready commit.
 Running instances do not consume the reserve budget after durable assignment.
+
+### Durable paused sandbox snapshots in Manifest storage
+
+The sandboxer selects the format of **new** pause checkpoints using its TOML
+configuration:
+
+```toml
+[checkpoint]
+mode = "local" # or "remote"
+```
+
+The default remains `remote` for compatibility with existing deployments.
+Unknown modes are rejected at configuration load. `local` retains a native
+RAM snapshot and independently owned CoW disk dependencies on local durable
+storage. CH captures private/anonymous guest RAM sparsely by reading the actual
+quiesced guest bytes and omitting all-zero 4 KiB pages from the newly created
+memory file. It must not copy private RAM from its backing file, whose bytes can
+be stale after CoW writes. The file retains its full logical length; capture
+still scans the complete RAM range and is not a dirty-page incremental snapshot.
+Nonzero RAM can still require the full guest RAM size on disk. Local capture
+does not chunk, compress or encrypt payloads. `remote` uses the
+accelerator Manifest/chunk pipeline below; the backend can itself be local or
+remote. Both modes retain guest/device barriers, file synchronization and atomic
+checkpoint publication. This setting does not change live-parent fork semantics.
+
+On restore, the sandboxer bounds the private writable disk chain before opening
+it in the VM. When the copied history plus its new writable leaf reaches four
+files, it invokes the same Cloud Hypervisor binary with
+`--compact-restored-disk <leaf>`. The offline helper takes an exclusive OFD lock,
+merges only sealed QCOW layers, synchronizes the result and atomically replaces
+this restore directory's history link. It does not read or flatten the raw or
+Manifest base, change the original checkpoint, or relax VMM seccomp rules.
+For offline restores on a filesystem supporting reflinks, ordinary allocated
+full QCOW clusters are merged with `FICLONERANGE`: the output shares immutable
+data extents through filesystem CoW instead of reading and rewriting them.
+Explicit zero overrides, compressed clusters and partial tails retain the
+existing copy/zero handling. Unsupported filesystems use the copy path; actual
+I/O errors fail the restore. Metadata/data synchronization and atomic publication
+remain mandatory. Live background merges retain their existing syscall policy.
+The sandboxer then removes only copied files unreachable from all configured
+disks and synchronizes the directory before publishing restore metadata.
+Set `RUST_LOG=checkpoint_timing=info` on the sandboxer to record disk-command and
+resume-stage durations. The compactor reports copied versus reflinked bytes.
+This also keeps repeated local checkpoint/resume cycles eligible for live fork;
+the existing live-fork chain-depth guard remains enabled.
+
+The mode is fixed for a deployment. Each new checkpoint records `storage_mode`;
+resume rejects a payload belonging to the other mode. Legacy checkpoints without
+the field are identified by their payload and remain readable in the matching
+mode. No automatic conversion between local and remote snapshots is performed.
+
+For remote saves or remote-checkpoint reads, configure the **sandboxer process**:
+
+* `KUASAR_CHECKPOINT_MANIFEST_RAW`: absolute path of accelerator `manifest-raw`.
+* `KUASAR_CHECKPOINT_MANIFEST_CONFIG`: private configuration of the existing
+  Store service and optional RocksDB Cache service, with the customer key.
+
+The following describes the remote path.
+
+Saving captures drained device state, RAM and the complete disk dependency set
+under the existing guest barrier. It ingests each payload using the existing
+chunking, deduplication, compression and encryption pipeline, then stores the
+file index through that same pipeline. Only after Store acknowledges persistence
+is the root Manifest reference atomically published in `checkpoint.json` and
+VM RAM released. Native capture files are removed before successful publication;
+`checkpoint.json` is a small recovery identity/reference, not a separate payload
+store. An unavailable store fails saving; it does not silently use native files.
+
+Manifest checkpoint resume authenticates the root index and restores
+**RAM through UFFD directly from authenticated chunks**.
+It does not reconstruct a `memory-ranges` RAM file. A private, mode-0700 runtime
+directory holds the pager socket; only the host-selected memory Manifest can be
+read through it. The sandboxer starts and reaps the helper outside VMM seccomp.
+Each page read decrypts, decompresses and verifies its chunk before UFFDIO_COPY;
+failures fail the restore or fault the VM, never substitute zero data. Known
+zero/hole extents come from authenticated metadata.
+
+The existing CH demand-first background population remains enabled. It skips
+known-zero pages; snapshot and live fork retain their existing safety gate until
+nonzero RAM population finishes. Once complete, private anonymous RAM supports
+normal host-fork CoW. Pager socket shutdown interrupts VMM reads on destruction.
+The helper exits on disconnect and its private socket directory is removed.
+
+Disk restore also reads authenticated Manifest chunks on demand. This uses the
+block-device read path, not the kernel userfaultfd API: each saved disk becomes a
+small host-marked descriptor underneath a new local QCOW2 leaf. Both the original
+base and previously saved QCOW2 data remain in the chunk store; restore fetches
+metadata without rebuilding the full disk. New writes stay in the private leaf,
+with the existing flush, fsync and checkpoint barriers retained.
+
+When saving a disk that already has a Manifest base, the helper combines its
+QCOW2 allocation tables into a flat logical block map. It ingests new layer data
+and the map through the same authenticated storage pipeline. Explicit zeroes,
+inherited sectors and overwritten sectors remain distinct. Repeated saves do
+not add recursive block-map chains. The private checkpoint copy is sealed only
+after the guest/device barrier has flushed the live writer; the running writer's
+header is not changed. Generated QCOW2 v2/v3 layers are supported; compressed,
+encrypted or extended-L2 QCOW2 inputs fail explicitly.
+
+Configure `KUASAR_CHECKPOINT_DISK_SOCKET` on the sandboxer to a private Unix
+socket served by the matching accelerator binary:
+
+```sh
+manifest-raw --manifest-config /private/manifest.yaml serve-disks /private/disk.sock
+```
+
+Keep the socket directory mode 0700; the service creates the socket mode 0600.
+Run this service independently of individual VMs so deleting a parent cannot
+stop its children's reads. Deploy matching sandboxer, Cloud Hypervisor and
+accelerator versions. Only host-created descriptors with the required xattr
+activate this protocol; ordinary guest disk bytes cannot impersonate one.
+On host fork, child block readers reconnect instead of sharing the parent's
+stream. Authentication, missing-object and transport errors fail reads rather
+than returning fabricated zeroes. Restoring a checkpoint rebinds descriptors to
+the configured local endpoint. Read-only dependencies are independently linked
+for descendants, so deleting a parent does not remove their disk paths.
+
+Template preparation still uses its native sparse RAM cache. Include initial
+chunk reads and first-command faults in restore timings; demand loading does not
+eliminate that work. Object-store retention/GC must retain checkpoint roots,
+their `objects` references (including flat-map dependencies), and objects used by
+active RAM pagers and disk readers. This integration does not automatically
+reclaim unreferenced chunks.
+
+Existing native checkpoints remain readable with `mode = "local"`. New remote checkpoint saves
+require the above Manifest configuration and fail before pausing the guest if it
+is absent. Local saves are explicit configuration, never a silent fallback. Report durable
+Store bytes separately from local restore carriers, running disk generations,
+and host page-cache residency; logical sparse file length is not stored bytes.

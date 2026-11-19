@@ -61,7 +61,7 @@ pub(super) async fn capture_mode(
         // Restored read-only images may also be QCOW wrappers. Preserve their
         // immutable backing chain in remote snapshots instead of requiring Raw.
         if lazy || ((local || disk["readonly"] == true) && disk["image_type"] == "Qcow2") {
-            copy_chain(&chain, work, true).await?;
+            copy_chain_with_sync(&chain, work, true, !(local && batch_checkpoint_sync())).await?;
             disk["path"] = json!(published.join(source.file_name().unwrap()));
             continue;
         }
@@ -161,7 +161,8 @@ pub(super) async fn capture_mode(
     Ok(())
 }
 
-/// Restore a new private qcow leaf with a private reflink of immutable history.
+/// Restore an independently owned writable QCOW top and private reflink history.
+/// An existing private QCOW copy needs no additional empty overlay.
 /// Both names live in the VM's managed fork-disks directory, so live fork can
 /// hard-link history into each child's own directory before parent destruction.
 pub(super) async fn stage(
@@ -187,7 +188,7 @@ pub(super) async fn stage(
         let (chain, size) = disk_chain(&source)?;
         let readonly = disk["readonly"] == true;
         let (base_name, format) = if disk["image_type"] == "Qcow2" {
-            let copied = copy_chain(&chain, directory, false).await?;
+            let copied = copy_chain_with_sync(&chain, directory, false, !batch_checkpoint_sync()).await?;
             owned.extend(copied);
             if readonly {
                 disk["path"] = json!(directory.join(source.file_name().unwrap()));
@@ -221,7 +222,7 @@ pub(super) async fn stage(
             if let Some(reference) = stored_reference(&source)? {
                 write_stored_reference(&base, &reference)?;
             }
-            std::fs::File::open(&base)?.sync_all()?;
+            if !batch_checkpoint_sync() { sync_payload(&base, "restore_base")?; }
             owned.push(base);
             (name, "raw")
         } else {
@@ -232,6 +233,23 @@ pub(super) async fn stage(
         if leaf.exists() {
             return Err(anyhow!("checkpoint disk generation exists"));
         }
+        let reuse_private_top = batch_checkpoint_sync() && !readonly && format == "qcow2";
+        if reuse_private_top {
+            // copy_chain created a distinct inode (reflink or independent
+            // copy), never a hard link to the checkpoint. It can be the
+            // writable top directly; adding an empty overlay would cause an
+            // unnecessary format/flush and often an immediate compaction.
+            let private_top = directory.join(&base_name);
+            use std::os::unix::fs::MetadataExt;
+            let private = std::fs::symlink_metadata(&private_top)?;
+            let original = std::fs::metadata(&source)?;
+            if !private.is_file() || private.nlink() != 1
+                || (private.dev() == original.dev() && private.ino() == original.ino()) {
+                return Err(anyhow!("restore top is not an independently owned file"));
+            }
+            std::fs::rename(&private_top, &leaf)?;
+            owned.retain(|path| path != &private_top);
+        } else {
         // -u does not open the metadata-only Manifest base as if it were data.
         // The authenticated logical size is explicit; CH verifies it on open.
         run(
@@ -251,11 +269,12 @@ pub(super) async fn stage(
             Some(directory),
         )
         .await?;
+        }
         std::fs::set_permissions(
             &leaf,
             std::fs::Permissions::from_mode(if readonly { 0o400 } else { 0o600 }),
         )?;
-        std::fs::File::open(&leaf)?.sync_all()?;
+        if !batch_checkpoint_sync() { sync_payload(&leaf, "restore_leaf")?; }
         disk["path"] = json!(leaf);
         disk["image_type"] = json!("Qcow2");
         disk["backing_files"] = json!(true);
@@ -263,7 +282,7 @@ pub(super) async fn stage(
         // Restore has no live-fork supervisor merge job. Compact only this
         // private, unopened copy, before another restore/fork can grow its chain.
         // Use the controller's exact binary; do not widen VMM seccomp policies.
-        if !readonly && chain.len() >= 3 {
+        if !readonly && chain.len() >= if reuse_private_top { 4 } else { 3 } {
             run(&format!("/proc/{hypervisor_pid}/exe"),
                 &["--compact-restored-disk", leaf.to_str().unwrap()], None).await?;
         }
@@ -278,7 +297,15 @@ pub(super) async fn stage(
         if !live.contains(path) { std::fs::remove_file(path)?; }
     }
     owned.retain(|path| live.contains(path));
-    std::fs::File::open(directory)?.sync_all()?;
+    if batch_checkpoint_sync() {
+        // Copies and newly created QCOW metadata remain private until all
+        // payloads and directory entries are durable. Reading them during
+        // private compaction requires visibility, not an intermediate flush.
+        let directory = directory.to_owned();
+        tokio::task::spawn_blocking(move || super::checkpoint::sync_tree(&directory)).await??;
+    } else {
+        std::fs::File::open(directory)?.sync_all()?;
+    }
     std::fs::File::open(directory.parent().unwrap())?.sync_all()?;
     Ok(owned)
 }
@@ -531,24 +558,44 @@ async fn copy_chain(
     destination: &Path,
     quiesced_capture: bool,
 ) -> Result<Vec<PathBuf>> {
+    copy_chain_with_sync(paths, destination, quiesced_capture, true).await
+}
+
+pub(super) fn batch_checkpoint_sync() -> bool {
+    std::env::var("KUASAR_CHECKPOINT_BATCH_SYNC").as_deref() != Ok("0")
+}
+
+fn sync_payload(path: &Path, phase: &str) -> Result<()> {
+    let started = std::time::Instant::now();
+    let result = std::fs::File::open(path)?.sync_all();
+    tracing::info!(target: "checkpoint_timing", phase, path = %path.display(),
+        elapsed_us = started.elapsed().as_micros() as u64, ok = result.is_ok(), "checkpoint payload sync");
+    result?;
+    Ok(())
+}
+
+async fn copy_chain_with_sync(
+    paths: &[PathBuf], destination: &Path, quiesced_capture: bool, durable: bool,
+) -> Result<Vec<PathBuf>> {
     let mut owned = Vec::new();
+    // One process per chain, not per dependency. Validate every destination
+    // first; do not touch the source chain or publish until all copies have
+    // completed and each file has crossed the existing durability barrier.
+    let mut args = vec!["--reflink=auto", "--preserve=xattr", "--"];
+    let mut names = std::collections::HashSet::new();
     for path in paths {
-        let target = destination.join(path.file_name().unwrap());
-        if target.exists() {
+        let name = path.file_name().ok_or_else(|| anyhow!("missing disk dependency name"))?;
+        if !names.insert(name) || destination.join(name).exists() {
             return Err(anyhow!("duplicate disk dependency name"));
         }
-        run(
-            "cp",
-            &[
-                "--reflink=auto",
-                "--preserve=xattr",
-                "--",
-                path.to_str().unwrap(),
-                target.to_str().unwrap(),
-            ],
-            None,
-        )
-        .await?;
+        args.push(path.to_str().ok_or_else(|| anyhow!("non-UTF8 disk dependency path"))?);
+    }
+    if !paths.is_empty() {
+        args.push(destination.to_str().ok_or_else(|| anyhow!("non-UTF8 disk directory"))?);
+        run("cp", &args, None).await?;
+    }
+    for path in paths {
+        let target = destination.join(path.file_name().unwrap());
         if quiesced_capture {
             use std::os::unix::fs::FileExt;
             let file = std::fs::File::open(&target)?;
@@ -569,7 +616,7 @@ async fn copy_chain(
                     std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600))?;
                     let file = std::fs::OpenOptions::new().write(true).open(&target)?;
                     file.write_all_at(&0u64.to_be_bytes(), 72)?;
-                    file.sync_all()?;
+                    if durable { sync_payload(&target, "seal_header")?; }
                 }
             }
         }
@@ -581,7 +628,7 @@ async fn copy_chain(
         if let Some(reference) = stored_reference(path)? {
             write_stored_reference(&target, &reference)?;
         }
-        std::fs::File::open(&target)?.sync_all()?;
+        if durable { sync_payload(&target, "seal_file")?; }
         owned.push(target);
     }
     Ok(owned)
@@ -696,6 +743,85 @@ mod tests {
         assert_eq!(std::fs::read(work.join("base.raw")).unwrap(), vec![0x55; 4096]);
         std::fs::remove_dir_all(&dir).unwrap();
     }
+
+    #[tokio::test]
+    async fn remote_capture_accepts_readonly_qcow_without_changing_source() {
+        let dir = std::env::temp_dir().join(format!("readonly-capture-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let base = dir.join("base.raw");
+        let bytes = vec![37u8; 1024 * 1024];
+        std::fs::write(&base, &bytes).unwrap();
+        run("qemu-img", &["create", "-f", "qcow2", "-F", "raw", "-b", "base.raw", "leaf.qcow2"], Some(&dir)).await.unwrap();
+        let leaf = dir.join("leaf.qcow2");
+        let original = std::fs::read(&leaf).unwrap();
+        let work = dir.join("capture");
+        let published = dir.join("published");
+        std::fs::create_dir(&work).unwrap();
+        let mut config = json!({"disks":[{"path":leaf,"image_type":"Qcow2","readonly":true,"backing_files":true}]});
+        capture_mode(&mut config, &work, &published, false).await.unwrap();
+        let exported = dir.join("verified.raw");
+        run("qemu-img", &["convert", "-f", "qcow2", "-O", "raw", work.join("leaf.qcow2").to_str().unwrap(), exported.to_str().unwrap()], None).await.unwrap();
+        assert_eq!(std::fs::read(exported).unwrap(), bytes);
+        assert_eq!(std::fs::read(&base).unwrap(), bytes);
+        assert_eq!(std::fs::read(&leaf).unwrap(), original);
+        assert_eq!(config["disks"][0]["image_type"], "Qcow2");
+        assert_eq!(config["disks"][0]["backing_files"], true);
+        assert_eq!(std::fs::metadata(work.join("leaf.qcow2")).unwrap().permissions().mode() & 0o222, 0);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn batch_copy_keeps_relative_chain_and_rejects_duplicates_before_writing() {
+        let dir = std::env::temp_dir().join(format!("batch-chain-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let base = dir.join("base.raw");
+        let bytes = vec![83u8; 512 * 1024];
+        std::fs::write(&base, &bytes).unwrap();
+        run("qemu-img", &["create", "-f", "qcow2", "-F", "raw", "-b", "base.raw", "leaf.qcow2"], Some(&dir)).await.unwrap();
+        let leaf = dir.join("leaf.qcow2");
+        let original = std::fs::read(&leaf).unwrap();
+        let dest = dir.join("copy");
+        std::fs::create_dir(&dest).unwrap();
+        assert!(copy_chain(&[base.clone(), base.clone()], &dest, false).await.is_err());
+        assert_eq!(std::fs::read_dir(&dest).unwrap().count(), 0);
+        let copied = copy_chain(&[leaf.clone(), base.clone()], &dest, false).await.unwrap();
+        assert_eq!(disk_chain(&copied[0]).unwrap().0, copied);
+        assert_eq!(std::fs::read(&copied[1]).unwrap(), bytes);
+        assert_eq!(std::fs::read(&leaf).unwrap(), original);
+        assert_eq!(std::fs::read(&base).unwrap(), bytes);
+        for path in copied {
+            assert_eq!(std::fs::metadata(path).unwrap().permissions().mode() & 0o222, 0);
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn staged_chain_survives_source_removal_with_batched_barrier() {
+        let dir = std::env::temp_dir().join(format!("stage-sync-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let base = dir.join("base.raw");
+        let data = vec![59u8; 512 * 1024];
+        std::fs::write(&base, &data).unwrap();
+        run("qemu-img", &["create", "-f", "qcow2", "-F", "raw", "-b", "base.raw", "old.qcow2"], Some(&dir)).await.unwrap();
+        let old = dir.join("old.qcow2");
+        std::fs::set_permissions(&old, std::fs::Permissions::from_mode(0o400)).unwrap();
+        let mut config = json!({"disks":[{"path":old,"readonly":false,"image_type":"Qcow2","backing_files":true}]});
+        let dest = dir.join("staged");
+        let owned = stage(&mut config, &dest, "restored", 0).await.unwrap();
+        assert_eq!(owned.len(), 2);
+        assert_eq!(std::fs::metadata(&old).unwrap().permissions().mode() & 0o222, 0);
+        let top = Path::new(config["disks"][0]["path"].as_str().unwrap());
+        assert_ne!(std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(top).unwrap()),
+                   std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(&old).unwrap()));
+        assert_ne!(std::fs::metadata(top).unwrap().permissions().mode() & 0o222, 0);
+        std::fs::remove_file(old).unwrap();
+        std::fs::remove_file(base).unwrap();
+        let output = dir.join("check.raw");
+        run("qemu-img", &["convert", "-f", "qcow2", "-O", "raw", config["disks"][0]["path"].as_str().unwrap(), output.to_str().unwrap()], None).await.unwrap();
+        assert_eq!(std::fs::read(output).unwrap(), data);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn ordinary_disk_data_is_not_a_host_manifest_reference() {
         let path = std::env::temp_dir().join(format!("manifest-test-{}", uuid::Uuid::new_v4()));

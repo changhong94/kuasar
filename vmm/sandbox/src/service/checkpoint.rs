@@ -17,13 +17,45 @@ async fn info(api: &str) -> anyhow::Result<Option<Value>> {
     }
 }
 
-fn sync_tree(path: &Path) -> anyhow::Result<()> {
-    for entry in std::fs::read_dir(path)? {
-        let path = entry?.path();
-        if path.is_dir() { sync_tree(&path)?; }
-        else { std::fs::File::open(&path)?.sync_all()?; }
+pub(super) fn sync_tree(path: &Path) -> anyhow::Result<()> {
+    let mut files = Vec::new();
+    let mut directories = Vec::new();
+    fn collect(path: &Path, files: &mut Vec<std::path::PathBuf>, directories: &mut Vec<std::path::PathBuf>) -> anyhow::Result<()> {
+        for entry in std::fs::read_dir(path)? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() { collect(&entry.path(), files, directories)?; }
+            else { files.push(entry.path()); }
+        }
+        directories.push(path.to_owned());
+        Ok(())
     }
-    std::fs::File::open(path)?.sync_all()?;
+    fn sync(path: &Path) -> anyhow::Result<()> {
+        let started = std::time::Instant::now();
+        let result = std::fs::File::open(path)?.sync_all();
+        tracing::info!(target: "checkpoint_timing", path = %path.display(),
+            elapsed_us = started.elapsed().as_micros() as u64, ok = result.is_ok(), "checkpoint commit sync");
+        result?;
+        Ok(())
+    }
+    collect(path, &mut files, &mut directories)?;
+    // Bounded parallel fsync allows the filesystem to coalesce persistence
+    // work. Every file must complete successfully before any directory sync,
+    // atomic publication, RAM release, or successful response to the caller.
+    let width = if super::disk_checkpoint::batch_checkpoint_sync() { 4 } else { 1 };
+    if width == 1 {
+        for file in &files { sync(file)?; }
+        for directory in &directories { sync(directory)?; }
+        return Ok(());
+    }
+    for batch in files.chunks(width) {
+        std::thread::scope(|scope| -> anyhow::Result<()> {
+            let handles: Vec<_> = batch.iter().map(|p| scope.spawn(move || sync(p))).collect();
+            let results: Vec<_> = handles.into_iter().map(|h| h.join()).collect();
+            for result in results { result.map_err(|_| anyhow!("checkpoint sync thread panicked"))??; }
+            Ok(())
+        })?;
+    }
+    for directory in directories { sync(&directory)?; }
     Ok(())
 }
 
@@ -333,4 +365,26 @@ where F: VMFactory + Sync + Send + 'static,
     smark("ram_release");
     Ok(json!({"ok":true,"status":"paused","checkpoint":directory,
         "guest_ram_released":true,"elapsed_ms":started.elapsed().as_secs_f64()*1000.0}))
+}
+
+#[cfg(test)]
+mod persistence_tests {
+    use super::*;
+
+    #[test]
+    fn commit_sync_covers_nested_files_and_propagates_payload_failure() {
+        let root = std::env::temp_dir().join(format!("checkpoint-sync-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("nested")).unwrap();
+        for i in 0..9 {
+            std::fs::write(root.join("nested").join(format!("payload-{i}")), vec![i as u8; 4096]).unwrap();
+        }
+        sync_tree(&root).unwrap();
+        // An unreadable/missing payload must fail the entire barrier: callers
+        // cannot publish the directory or release the original VM on error.
+        std::os::unix::fs::symlink(root.join("missing"), root.join("invalid-payload")).unwrap();
+        assert!(sync_tree(&root).is_err());
+        std::fs::remove_file(root.join("invalid-payload")).unwrap();
+        sync_tree(&root).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

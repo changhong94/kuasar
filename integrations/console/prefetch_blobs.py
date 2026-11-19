@@ -8,8 +8,6 @@ import requests
 def prefetch(name,manifest,layout):
  if not name.startswith('docker.io/'):return
  repo=name[len('docker.io/'):];root=Path(layout)/'blobs/sha256';root.mkdir(parents=True,exist_ok=True)
- token=requests.get('https://auth.docker.io/token',params={'service':'registry.docker.io','scope':f'repository:{repo}:pull'},timeout=60)
- token.raise_for_status();headers={'Authorization':'Bearer '+token.json()['token']}
  for desc in [manifest['config'],*manifest.get('layers',[])]:
   digest=desc['digest'];size=desc['size']
   if not re.fullmatch('sha256:[0-9a-f]{64}',digest):raise ValueError('unsupported blob digest')
@@ -21,6 +19,8 @@ def prefetch(name,manifest,layout):
     for data in iter(lambda:f.read(8*1024*1024),b''):h.update(data)
    return h.hexdigest()==digest[7:]
   if verify(target):continue
+  token=requests.get('https://auth.docker.io/token',params={'service':'registry.docker.io','scope':f'repository:{repo}:pull'},timeout=60)
+  token.raise_for_status();headers={'Authorization':'Bearer '+token.json()['token']}
   endpoint=f'https://registry-1.docker.io/v2/{repo}/blobs/{digest}'
   response=requests.get(endpoint,headers=headers,allow_redirects=False,stream=True,timeout=60)
   if response.is_redirect:

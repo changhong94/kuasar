@@ -100,15 +100,39 @@ pub(crate) async fn new_snapshot_sandbox_client(address: &str) -> Result<Sandbox
 pub(crate) async fn reconnect_checked_sandbox_client(
     address: &str,
 ) -> Result<SandboxServiceClient> {
+    reconnect_checked_client(address, false).await
+}
+
+/// Pipelined resume uses the existing snapshot handshake while retaining the
+/// Check RPC and the same overall deadline as ordinary fork reconnection.
+pub(crate) async fn reconnect_snapshot_checked_client(address: &str) -> Result<SandboxServiceClient> {
+    reconnect_checked_client(address, true).await
+}
+
+async fn reconnect_checked_client(address: &str, snapshot: bool) -> Result<SandboxServiceClient> {
     let mut last_error = String::new();
     let attempt = async {
         loop {
             let result = async {
-                let client = new_sandbox_client(address).await?;
+                let connect_started = std::time::Instant::now();
+                let client = if snapshot {
+                    new_snapshot_sandbox_client(address).await?
+                } else {
+                    new_sandbox_client(address).await?
+                };
+                let handshake_ms = connect_started.elapsed().as_secs_f64() * 1000.0;
+                let check_started = std::time::Instant::now();
                 client
                     .check(with_timeout(1_000_000_000), &CheckRequest::new())
                     .await
                     .map_err(|e| anyhow!("agent check: {}", e))?;
+                if snapshot {
+                    tracing::info!(
+                        handshake_ms,
+                        check_ms = check_started.elapsed().as_secs_f64() * 1000.0,
+                        "LIVE_SNAPSHOT_AGENT"
+                    );
+                }
                 Ok::<_, Error>(client)
             }
             .await;
@@ -512,10 +536,15 @@ mod tests {
 
     #[tokio::test]
     async fn fork_reconnect_replaces_a_reset_connection() {
-        reconnect_replaces_a_reset_connection().await;
+        reconnect_replaces_a_reset_connection(false).await;
     }
 
-    async fn reconnect_replaces_a_reset_connection() {
+    #[tokio::test]
+    async fn live_snapshot_reconnect_replaces_a_reset_connection() {
+        reconnect_replaces_a_reset_connection(true).await;
+    }
+
+    async fn reconnect_replaces_a_reset_connection(snapshot: bool) {
         use std::{sync::Arc, time::Duration};
 
         use vmm_common::api::{
@@ -553,7 +582,7 @@ mod tests {
         let client = tokio::time::timeout(
             Duration::from_secs(3),
             async {
-                super::reconnect_checked_sandbox_client(&address).await
+                super::reconnect_checked_client(&address, snapshot).await
             },
         )
         .await

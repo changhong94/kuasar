@@ -47,6 +47,17 @@ class ManifestTemplateTests(unittest.TestCase):
         self.assertFalse(path.exists())
         self.assertTrue(self.source.exists())
 
+    def test_capture_reference_reuses_store_without_second_upload(self):
+        original = self.backend.publish(self.source)
+        (self.source/'chunk-reference.json').write_text(json.dumps(
+            dict(version=1,manifest='root-key',files=original['files'])))
+        def no_upload(*args):
+            raise AssertionError('capture already persisted these chunks')
+        self.backend.invoke = no_upload
+        result = self.backend.publish(self.source)
+        self.assertEqual(result['root_manifest'], 'root-key')
+        self.assertEqual(result['files'], original['files'])
+
     def test_bad_size_never_publishes(self):
         descriptor = self.backend.publish(self.source)
         descriptor['files'][0]['logical_bytes'] += 1

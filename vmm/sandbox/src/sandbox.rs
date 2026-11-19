@@ -1820,6 +1820,11 @@ where
         crate::client::reconnect_checked_sandbox_client(&address).await
     }
 
+    pub(crate) async fn prepare_live_snapshot_agent(&self) -> Result<SandboxServiceClient> {
+        self.client.lock().await.take();
+        crate::client::reconnect_snapshot_checked_client(&self.vm.socket_address()).await
+    }
+
     pub(crate) async fn install_fork_agent(&mut self, client: SandboxServiceClient) {
         *self.client.lock().await = Some(client);
         self.forward_events().await;
@@ -2600,6 +2605,9 @@ impl<'de> Deserialize<'de> for MemoryRestoreMode {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SnapshotConfig {
+    /// Internal policy populated from the top-level `[checkpoint]` section.
+    #[serde(skip)]
+    pub checkpoint_mode: crate::config::CheckpointMode,
     /// Enable Environment (bare VM) snapshot restore instead of cold-booting each sandbox.
     /// Safe to enable after validating that the hypervisor restore process works end-to-end.
     pub enable_environment_restore: bool,
@@ -2626,6 +2634,7 @@ const DEFAULT_MAX_CONCURRENT_RESTORES: usize = 4;
 impl Default for SnapshotConfig {
     fn default() -> Self {
         Self {
+            checkpoint_mode: crate::config::CheckpointMode::Remote,
             enable_environment_restore: false,
             enable_warmfork_restore: false,
             enable_continuation_restore: false,

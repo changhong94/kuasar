@@ -24,10 +24,26 @@ use crate::sandbox::{SandboxConfig, TemplateLeaseMode};
 
 #[derive(Deserialize)]
 pub struct Config<T> {
+    #[serde(default)]
+    pub checkpoint: CheckpointConfig,
     pub sandbox: SandboxConfig,
     pub hypervisor: T,
     #[serde(default)]
     pub template_pool: Option<TemplatePoolConfig>,
+}
+
+/// Selects new checkpoint publication; existing snapshots retain their format.
+#[derive(Clone, Debug, Default, Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum CheckpointMode {
+    Local,
+    #[default]
+    Remote,
+}
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CheckpointConfig {
+    pub mode: CheckpointMode,
 }
 
 /// Top-level template pool configuration.
@@ -98,6 +114,7 @@ pub struct WarmForkPoolConfig {
 impl<T: DeserializeOwned> Config<T> {
     pub fn new(sandbox: SandboxConfig, hypervisor: T) -> Self {
         Self {
+            checkpoint: CheckpointConfig::default(),
             sandbox,
             hypervisor,
             template_pool: None,
@@ -112,8 +129,9 @@ impl<T: DeserializeOwned> Config<T> {
         // Parse config from toml file
         let toml_str = read_to_string(config_path).await?;
 
-        let config = toml::from_str(&toml_str)
+        let mut config: Self = toml::from_str(&toml_str)
             .map_err(|e| anyhow!("failed to parse kuasar sandboxer config: {}", e))?;
+        config.sandbox.snapshot.checkpoint_mode = config.checkpoint.mode.clone();
         Ok(config)
     }
 }
@@ -131,6 +149,19 @@ pub mod tests {
         config::Config,
         sandbox::{SandboxConfig, TemplateLeaseMode},
     };
+
+    #[tokio::test]
+    async fn checkpoint_mode_selects_save_format() {
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join("checkpoint.toml");
+        for (mode, expected) in [("local", super::CheckpointMode::Local), ("remote", super::CheckpointMode::Remote)] {
+            std::fs::write(&file, format!("[sandbox]\n[hypervisor]\npath='mock'\n[checkpoint]\nmode='{mode}'\n")).unwrap();
+            let config: Config<MockHypervisor> = Config::load_config(file.to_str().unwrap()).await.unwrap();
+            assert_eq!(config.sandbox.snapshot.checkpoint_mode, expected);
+        }
+        std::fs::write(&file, "[sandbox]\n[hypervisor]\npath='mock'\n[checkpoint]\nmode='invalid'\n").unwrap();
+        assert!(Config::<MockHypervisor>::load_config(file.to_str().unwrap()).await.is_err());
+    }
 
     #[derive(Deserialize)]
     struct MockHypervisor {

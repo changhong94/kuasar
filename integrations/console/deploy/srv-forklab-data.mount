@@ -1,0 +1,10 @@
+[Unit]
+Description=Fork console dedicated CoW storage
+Before=forklab-sandboxer.service forklab-web.service
+[Mount]
+What=/srv/forklab/data.xfs
+Where=/srv/forklab/data
+Type=xfs
+Options=loop
+[Install]
+WantedBy=multi-user.target

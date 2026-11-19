@@ -1,0 +1,1 @@
+{"cniVersion": "1.0.0", "name": "forklab", "type": "bridge", "bridge": "forklab0", "isGateway": true, "ipMasq": true, "ipam": {"type": "host-local", "dataDir": "/srv/forklab/data/ipam", "subnet": "10.208.108.0/24", "routes": [{"dst": "0.0.0.0/0"}]}}

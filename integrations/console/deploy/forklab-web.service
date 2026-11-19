@@ -1,0 +1,13 @@
+[Unit]
+Description=Fork Lab dedicated web console
+Requires=forklab-sandboxer.service
+After=forklab-sandboxer.service network-online.target
+[Service]
+Type=simple
+WorkingDirectory=/srv/forklab/app
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 /srv/forklab/app/server.py
+Restart=on-failure
+RestartSec=3
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,21 @@
+[Unit]
+Description=Fork console dedicated sandbox runtime
+Requires=srv-forklab-data.mount
+After=srv-forklab-data.mount network-online.target
+[Service]
+Type=simple
+RuntimeDirectory=forklab
+RuntimeDirectoryMode=0700
+Environment=RUST_LOG=info
+Environment=CH_FORK_TIMING=1
+Environment=KUASAR_FORK_RUNTIME_DIR=/run/forklab/vms
+Environment=KUASAR_SNAPSHOT_POOL_ROOT=/srv/forklab/data/templates
+ExecStartPre=/usr/bin/mkdir -p /run/forklab/vms
+ExecStart=/srv/forklab/bin/sandboxer -c /srv/forklab/sandboxer.toml -d /srv/forklab/data/state -l /run/forklab/sandboxer.sock --admin-listen /run/forklab/admin.sock
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=65536
+KillMode=control-group
+TimeoutStopSec=60
+[Install]
+WantedBy=multi-user.target

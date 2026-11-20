@@ -2,6 +2,7 @@
 """Standalone LAN console. Runtime, storage, network and binaries are dedicated.
 No raw host paths, commands or runtime admin endpoints are exposed over HTTP.
 """
+import secrets
 import concurrent.futures, contextlib, http.server, json, os, re, shutil, socket, sqlite3, subprocess as sp, sys, threading, time, uuid
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -163,6 +164,21 @@ def reconcile():
   except Exception as e:print('reconcile:',e,flush=True)
   time.sleep(2)
 
+def image_short_name(reference):
+ # Drop the registry/organization and the tag or digest, not repository text.
+ return reference.split('@',1)[0].rsplit('/',1)[-1].split(':',1)[0]
+
+def unique_display_name(prefix,reference):
+ # Called under LOCK together with the SQLite insert. Existing (including
+ # deleted) names stay unchanged and cannot be reused by a new object.
+ stem=f'{prefix}-{image_short_name(reference)}-'
+ used={r['name'] for table in ['sandboxes','snapshots'] for r in rows(table)}
+ if sum(n.startswith(stem) and re.fullmatch(r'[0-9]{5}',n[len(stem):]) is not None for n in used)>=100000:
+  raise ValueError('此镜像的五位编号已用尽')
+ while True:
+  name=f'{stem}{secrets.randbelow(100000):05d}'
+  if name not in used:return name
+
 def submit(path,body):
  with LOCK:
   if path=='/api/create':
@@ -177,17 +193,13 @@ def submit(path,body):
    else:raise ValueError('无效的创建来源')
    if len([r for r in rows('sandboxes') if r['state']!='deleted'])>=MAX_SANDBOXES:raise ValueError(f'此专属服务最多同时保留 {MAX_SANDBOXES} 个沙箱，请先销毁不用的沙箱')
    ident='sb-'+uuid.uuid4().hex[:12]
-   row=dict(id=ident,name=ident,image_id=im['id'],image_name=im['name'],snapshot_id=source if kind=='snapshot' else None,state='creating',busy=True,created_at=time.time())
+   row=dict(id=ident,name=unique_display_name('sandbox',im['name']),image_id=im['id'],image_name=im['name'],snapshot_id=source if kind=='snapshot' else None,state='creating',busy=True,created_at=time.time())
    put('sandboxes',row);POOL.submit(create_worker,ident,source,kind);return row
   if path=='/api/snapshot':
-   ident=body.get('sandbox_id');row=get('sandboxes',ident);name=body.get('name','').strip()
-   if not name or len(name)>240 or any(ord(c)<32 for c in name):raise ValueError('名称需为 1–240 个可见字符')
+   ident=body.get('sandbox_id');row=get('sandboxes',ident)
    if row['state']!='running' or row.get('busy'):raise ValueError('只有运行中的空闲沙箱可以创建快照')
-   if any(s['name']==name and s['state']!='deleted' for s in rows('snapshots')):raise ValueError('已有同名快照，请修改名称')
    if any(s['parent']==ident and s['state'] in ['capturing','saving'] for s in rows('snapshots')):raise ValueError('此沙箱已有快照正在保存')
-   # Preserve unique SQL identity of deleted snapshots while allowing name reuse.
-   for old in rows('snapshots'):
-    if old['name']==name:update('snapshots',old['id'],name=old['name']+' [deleted '+old['id']+']')
+   name=unique_display_name('snapshot',row['image_name'])
    snap=dict(id='sn-'+uuid.uuid4().hex,name=name,parent=ident,image_id=row['image_id'],image_name=row['image_name'],state='capturing',created_at=time.time())
    put('snapshots',snap);update('sandboxes',ident,busy=True);POOL.submit(capture_worker,ident,snap['id']);return snap
   if path=='/api/action':

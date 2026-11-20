@@ -55,9 +55,15 @@ barriers, then saving finishes in the background. Only durable snapshots can be
 restored. Pause duration and request-to-durable duration are runtime measurements,
 not browser polling latency. This deployment selects local persistence.
 
-Snapshot display names are independent of filesystem IDs, may contain image
-slashes/colons or Chinese text, and are checked atomically for duplicates.
-The default is the image name followed by `_` and five random digits.
+Display names are independent of filesystem IDs. New instances use
+`sandbox-<image repository name>-<five random digits>` and new snapshots use
+`snapshot-<image repository name>-<five random digits>`. Registry/organization
+and tag/digest are omitted. The server regenerates collisions under the same
+lock as reservation, including names of deleted objects. Existing names and
+IDs remain unchanged. No snapshot-name input is shown. Instances and saved
+snapshots are shown in separate Sandbox and Snapshot tables. Restore on a
+saved snapshot creates a new independent instance without deleting the snapshot.
+The demo does not expose VM pause/resume controls.
 Only running sandboxes can capture a snapshot; both UI and server enforce this.
 Base images cannot be deleted through the API. Deleting a snapshot hides it and
 prevents new restores, while its backing files remain pinned until existing

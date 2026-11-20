@@ -35,8 +35,14 @@ def prepare(backend, sid, info, base):
     if not stat.S_ISREG(st.st_mode) or st.st_mode & 0o222:
         raise ValueError('Writable storage template must be a sealed regular file')
     directory=Path(backend.args.sandbox_state)/sid/'fork-disks'
-    directory.mkdir(mode=0o700)
+    directory.mkdir(mode=0o700, exist_ok=True)
+    if directory.is_symlink() or not directory.is_dir():
+        raise ValueError('Invalid managed disk directory')
     source=directory/'empty.raw';leaf=directory/'empty.qcow2'
+    with source.open('xb'):
+        pass
+    if os.path.lexists(leaf):
+        raise FileExistsError(leaf)
     subprocess.run(['cp','--reflink=always','--',str(base),str(source)],check=True,capture_output=True)
     source.chmod(0o400)
     subprocess.run(['qemu-img','create','-f','qcow2','-F','raw','-b','empty.raw','empty.qcow2'],cwd=directory,check=True,capture_output=True)
